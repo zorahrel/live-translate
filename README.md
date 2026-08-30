@@ -4,10 +4,24 @@ Sottotitoli tradotti in tempo reale da quello che sente il microfono.
 
 ```
 live-translate                       # portoghese -> italiano, modello turbo
+live-translate --bidi                # conversazione a due: traduce in entrambi i versi
 live-translate --src auto            # rileva la lingua parlata
 live-translate --model base          # piu' rapido, meno preciso
 live-translate --capture 3           # audio di sistema (eqMac Export)
 ```
+
+## Bidirezionale
+`⇄ auto` nella barra, o `--bidi`. Le due lingue del dialogo sono quelle nei due
+menu; da li' in poi ogni frase viene instradata da sola e il verso opposto
+appare rientrato e viola, cosi' si vede chi parla senza leggere.
+
+La direzione si decide in cascata, e ogni riga dichiara nei metadati come:
+1. **`parole`** — stopword confrontate *solo* fra le due lingue attive. Su otto frasi reali pt/it: 6 corrette, 2 indecise, 0 sbagliate. Richiede almeno 4 parole e uno scarto di almeno 2 occorrenze.
+2. **`whisper N%`** — la lingua auto-rilevata da whisper (`-l auto`), sopra il 50% di confidenza e non piu' vecchia di 25s. Copre le frasi corte: `"Ai que medo!"` e' andata cosi'.
+3. **`default`** — in dubbio si tiene la direzione principale. Tradurre a rovescio per sbaglio confonde piu' che non tradurre.
+
+In bidi whisper perde `-kc` (contesto fra chunk): su due lingue alternate il
+contesto lo spinge a restare in quella precedente.
 
 Si apre una finestra sopra le altre: traduzione grande, originale sotto.
 Dalla barra si cambiano a caldo **lingua sorgente, lingua di arrivo, modello e
@@ -39,4 +53,5 @@ Qui: `1` = microfono interno, `3` = eqMac Export (audio di sistema).
 
 ## Limiti noti
 - Latenza ~1,5-2,5s con turbo: whisper aspetta la fine della frase, poi traduce in ~0,8s.
+- In bidi whisper gira in `-l auto`, un filo piu' lento e un filo meno preciso di quando la lingua e' dichiarata.
 - Il VU meter chiede il permesso microfono al browser: se lo neghi resta grigio, la trascrizione funziona lo stesso (sono due stream distinti).

@@ -68,7 +68,48 @@ MODELS = [
 ]
 MODEL_FILE = {k: f for k, _, f in MODELS}
 
-CFG = {"src": "pt", "dst": "it", "model": "turbo", "capture": "1", "mic": 30}
+CFG = {"src": "pt", "dst": "it", "model": "turbo", "capture": "1", "mic": 30,
+       "bidi": False, "langA": "pt", "langB": "it"}
+
+DET_RE = re.compile(r"auto-detected language: ([a-z]{2,3}) \(p = ([0-9.]+)\)")
+det_lock = threading.Lock()
+det_lang = {"code": "", "p": 0.0, "at": 0.0}
+
+# parole funzione: whisper confonde spesso pt/es/it fra loro sulle frasi corte
+STOPWORDS = {
+    "pt": {"que", "nao", "não", "para", "com", "uma", "meu", "minha", "voce", "você", "isso",
+           "muito", "esta", "está", "eu", "ele", "ela", "tem", "mais", "pra", "aqui", "entao",
+           "então", "ja", "já", "tudo", "bem", "cara", "gente", "ser", "fazer", "coisa"},
+    "it": {"che", "non", "per", "con", "una", "mio", "mia", "tu", "questo", "molto", "sono",
+           "lui", "lei", "ha", "piu", "più", "qui", "allora", "gia", "già", "tutto", "bene",
+           "cosa", "fare", "essere", "anche", "come", "quando", "perche", "perché", "cosi"},
+    "es": {"que", "no", "para", "con", "una", "mi", "tu", "esto", "muy", "estoy", "él", "ella",
+           "tiene", "mas", "más", "aqui", "aquí", "entonces", "ya", "todo", "bien", "cosa",
+           "hacer", "ser", "tambien", "también", "como", "cuando", "porque", "pero"},
+    "en": {"the", "and", "that", "for", "with", "you", "this", "very", "have", "here", "then",
+           "all", "good", "thing", "make", "just", "what", "when", "because", "but", "about"},
+    "fr": {"que", "pas", "pour", "avec", "une", "mon", "vous", "cela", "tres", "très", "suis",
+           "il", "elle", "plus", "ici", "alors", "deja", "déjà", "tout", "bien", "chose"},
+}
+
+
+def guess_lang(text: str, candidates) -> str:
+    """Rilevamento a stopword fra le sole lingue candidate. '' se e' indeciso."""
+    words = re.findall(r"[a-zà-ÿ]+", text.lower())
+    if len(words) < 4:
+        return ""
+    scores = {}
+    for c in candidates:
+        sw = STOPWORDS.get(c)
+        if sw:
+            scores[c] = sum(1 for w in words if w in sw)
+    if not scores:
+        return ""
+    best = max(scores, key=scores.get)
+    ranked = sorted(scores.values(), reverse=True)
+    if ranked[0] == 0 or (len(ranked) > 1 and ranked[0] - ranked[1] < 2):
+        return ""
+    return best
 src_q: "queue.Queue" = queue.Queue()
 subscribers: "list" = []
 sub_lock = threading.Lock()
@@ -124,7 +165,7 @@ def broadcast(evt: dict, save: bool = False) -> None:
 def _t_llm(text: str) -> str:
     if not API_KEY:
         return ""
-    dst_name = LANG_NAME.get(CFG["dst"], CFG["dst"])
+    dst_name = LANG_NAME.get(ACTIVE["dst"], ACTIVE["dst"])
     payload = {
         "model": "gpt-oss-120b",
         "messages": [
@@ -145,11 +186,11 @@ def _t_llm(text: str) -> str:
 
 def _t_apple(text: str) -> str:
     """Traduzione on-device di macOS. Nessuna rete, nessuna quota."""
-    src = CFG["src"] if CFG["src"] != "auto" else "und"
+    src = ACTIVE["src"] if ACTIVE["src"] != "auto" else "und"
     script = os.path.join(HERE, "apple_translate")
     if not os.path.exists(script):
         return ""
-    r = subprocess.run([script, src, CFG["dst"], text], capture_output=True,
+    r = subprocess.run([script, src, ACTIVE["dst"], text], capture_output=True,
                        text=True, timeout=20)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "apple translate ko").strip()[:80])
@@ -157,9 +198,9 @@ def _t_apple(text: str) -> str:
 
 
 def _t_mymemory(text: str) -> str:
-    src = CFG["src"] if CFG["src"] != "auto" else "autodetect"
+    src = ACTIVE["src"] if ACTIVE["src"] != "auto" else "autodetect"
     url = ("https://api.mymemory.translated.net/get?q=" + urllib.parse.quote(text[:480])
-           + f"&langpair={src}|{CFG['dst']}")
+           + f"&langpair={src}|{ACTIVE['dst']}")
     req = urllib.request.Request(url, headers={"User-Agent": "live-translate/1.0"})
     with urllib.request.urlopen(req, timeout=12) as r:
         data = json.loads(r.read())
@@ -169,12 +210,16 @@ def _t_mymemory(text: str) -> str:
     return out
 
 
+ACTIVE = {"src": "pt", "dst": "it"}
 BACKENDS = [("cerebras", _t_llm), ("apple", _t_apple), ("mymemory", _t_mymemory)]
 _dead: set = set()
 
 
-def translate(text: str):
-    if CFG["src"] == CFG["dst"]:
+def translate(text: str, src_l: str = "", dst_l: str = ""):
+    src_l = src_l or CFG["src"]
+    dst_l = dst_l or CFG["dst"]
+    ACTIVE.update(src=src_l, dst=dst_l)
+    if src_l == dst_l:
         return text, "passthrough"
     errs = []
     for name, fn in BACKENDS:
@@ -193,6 +238,17 @@ def translate(text: str):
 
 
 # ------------------------------------------------------------------- pipeline
+def stderr_thread(proc, my_gen: int) -> None:
+    """whisper.cpp scrive la lingua rilevata su stderr, non su stdout."""
+    for raw in proc.stderr:
+        if stop_flag.is_set() or my_gen != gen:
+            break
+        m = DET_RE.search(raw)
+        if m:
+            with det_lock:
+                det_lang.update(code=m.group(1), p=float(m.group(2)), at=time.time())
+
+
 def reader_thread(proc, my_gen: int) -> None:
     buf = []
     for raw in proc.stdout:
@@ -231,14 +287,34 @@ def translator_thread() -> None:
         last = text
         seq += 1
         sid = seq
-        broadcast({"type": "partial", "id": sid, "src": text, "t": time.strftime("%H:%M:%S")})
+        src_l, dst_l, how = route(text)
+        broadcast({"type": "partial", "id": sid, "src": text, "srcLang": src_l,
+                   "dstLang": dst_l, "t": time.strftime("%H:%M:%S")})
         broadcast({"type": "status", "state": "busy", "text": "traduco"})
         t0 = time.time()
-        out, backend = translate(text)
+        out, backend = translate(text, src_l, dst_l)
         broadcast({"type": "line", "id": sid, "src": text, "dst": out, "backend": backend,
                    "ms": int((time.time() - t0) * 1000), "t": time.strftime("%H:%M:%S"),
-                   "srcLang": CFG["src"], "dstLang": CFG["dst"]}, save=True)
+                   "srcLang": src_l, "dstLang": dst_l, "how": how}, save=True)
         broadcast({"type": "status", "state": "live", "text": "in ascolto"})
+
+
+def route(text: str):
+    """Sceglie la direzione della traduzione. Ritorna (src, dst, come_e_stato_deciso)."""
+    if not CFG["bidi"]:
+        return CFG["src"], CFG["dst"], "fisso"
+    a, b = CFG["langA"], CFG["langB"]
+    # 1. le stopword sono piu' affidabili di whisper sulle frasi corte, ma servono >=4 parole
+    g = guess_lang(text, (a, b))
+    if g:
+        return (a, b, "parole") if g == a else (b, a, "parole")
+    # 2. altrimenti la lingua che whisper ha rilevato per questo chunk, se e' una delle due
+    with det_lock:
+        code, prob, at = det_lang["code"], det_lang["p"], det_lang["at"]
+    if code in (a, b) and prob >= 0.5 and time.time() - at < 25:
+        return (a, b, f"whisper {prob:.0%}") if code == a else (b, a, f"whisper {prob:.0%}")
+    # 3. in dubbio si tiene la direzione principale: meglio non tradurre che invertire a caso
+    return a, b, "default"
 
 
 def start_whisper() -> None:
@@ -257,11 +333,16 @@ def start_whisper() -> None:
             except subprocess.TimeoutExpired:
                 whisper_proc.kill()
         # M2 Max: 8 core performance, whisper.cpp gira su Metal per l'encoder
-        cmd = [WHISPER, "-m", model_path, "-l", CFG["src"], "--step", "0", "--length", "6000",
-               "-vth", "0.6", "-c", CFG["capture"], "-t", "8", "-kc"]
+        # in bidirezionale whisper deve poter riconoscere entrambe le lingue
+        lang = "auto" if CFG["bidi"] else CFG["src"]
+        cmd = [WHISPER, "-m", model_path, "-l", lang, "--step", "0", "--length", "6000",
+               "-vth", "0.6", "-c", CFG["capture"], "-t", "8"]
+        if not CFG["bidi"]:
+            cmd.append("-kc")  # il contesto aiuta, ma su due lingue alternate confonde
         whisper_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                        stderr=subprocess.PIPE, text=True, bufsize=1)
         threading.Thread(target=reader_thread, args=(whisper_proc, my_gen), daemon=True).start()
+        threading.Thread(target=stderr_thread, args=(whisper_proc, my_gen), daemon=True).start()
     broadcast({"type": "cfg", **CFG})
     broadcast({"type": "status", "state": "live", "text": "in ascolto"})
 
@@ -334,6 +415,11 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  main::-webkit-scrollbar-thumb{background:#1a1c24;border-radius:4px}
  body.big .it{font-size:40px}
  body.big .pt,body.big .meta{display:none}
+ /* in bidirezionale il verso opposto e' rientrato e di un altro colore */
+ body.bidi .row.rev{border-left-color:#c084fc;margin-left:38px}
+ body.bidi .row.rev.top{border-left-color:#e0a3ff}
+ body.bidi .row.rev .it{color:#e9d5ff}
+ body.bidi .row.rev.top .it{color:#faf5ff}
 </style></head><body>
 <header>
  <span class="dot" id="d"></span><span id="st">connessione…</span>
@@ -346,6 +432,7 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
    <input type="range" id="vol" min="0" max="100" step="1">
    <span id="volv">—</span>
  </div>
+ <button id="bidi" title="bidirezionale: rileva chi parla e traduce nel verso giusto">&#8644; auto</button>
  <span class="sp"></span>
  <button id="swap" title="inverti le lingue">&#8646;</button>
  <button id="big" title="testo grande, senza originale">Aa</button>
@@ -385,7 +472,10 @@ function partial(e){const r=rowEl(e);
 function line(e,old){const r=rowEl(e,old);r.classList.remove('wait');
   r.querySelector('.it').textContent=e.dst;
   r.querySelector('.pt').textContent=e.src;
-  r.querySelector('.meta').textContent=e.t+' · '+e.srcLang+'→'+e.dstLang+' · '+e.backend+' · '+e.ms+'ms';
+  r.querySelector('.meta').textContent=e.t+' · '+e.srcLang+'→'+e.dstLang
+    +(e.how&&e.how!=='fisso'?' ('+e.how+')':'')+' · '+e.backend+' · '+e.ms+'ms';
+  r.dataset.dir=e.srcLang;
+  if(e.srcLang===selD.value&&document.body.classList.contains('bidi'))r.classList.add('rev');
   if(!old)bk.textContent=e.backend;}
 function post(b){return fetch('/cfg',{method:'POST',body:JSON.stringify(b)});}
 
@@ -393,6 +483,7 @@ selS.onchange=()=>post({src:selS.value});
 selD.onchange=()=>post({dst:selD.value});
 selM.onchange=()=>post({model:selM.value});
 $('swap').onclick=()=>{if(selD.value!=='auto')post({src:selD.value,dst:selS.value==='auto'?'it':selS.value});};
+$('bidi').onclick=()=>post({bidi:!document.body.classList.contains('bidi')});
 $('big').onclick=e=>{document.body.classList.toggle('big');e.target.classList.toggle('on');};
 $('clr').onclick=()=>{log.innerHTML='';rows.clear();};
 $('save').onclick=()=>{window.open('/export','_blank');};
@@ -422,7 +513,9 @@ fetch('/langs').then(r=>r.json()).then(j=>{
   LS=j.langs;LD=j.dstLangs;
   fill(selS,LS,j.src);fill(selD,LD,j.dst);
   fill(selM,j.models.map(m=>[m[0],m[1]]),j.model);
-  $('vol').value=j.mic;$('volv').textContent=j.mic;});
+  $('vol').value=j.mic;$('volv').textContent=j.mic;
+  document.body.classList.toggle('bidi',!!j.bidi);
+  $('bidi').classList.toggle('on',!!j.bidi);});
 
 fetch('/history').then(r=>r.json()).then(j=>{
   if(!j.rows.length)return;
@@ -437,7 +530,10 @@ es.onmessage=ev=>{const e=JSON.parse(ev.data);
   else if(e.type==='partial')partial(e);
   else if(e.type==='cfg'){fill(selS,LS,e.src);fill(selD,LD,e.dst);
     if(selM.options.length)selM.value=e.model;
-    $('vol').value=e.mic;$('volv').textContent=e.mic;}
+    $('vol').value=e.mic;$('volv').textContent=e.mic;
+    document.body.classList.toggle('bidi',!!e.bidi);
+    $('bidi').classList.toggle('on',!!e.bidi);
+    selS.disabled=false;$('swap').style.opacity=e.bidi?.35:1;}
   else if(e.type==='status'){d.className='dot '+(e.state==='live'?'':e.state);st.textContent=e.text;}
 };
 es.onerror=()=>{d.className='dot off';st.textContent='disconnesso';};
@@ -468,11 +564,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             body = {}
         restart = False
+        if body.get("bidi") is not None and bool(body["bidi"]) != CFG["bidi"]:
+            CFG["bidi"] = bool(body["bidi"])
+            if CFG["bidi"]:
+                # le due lingue del dialogo sono quelle scelte nei menu
+                CFG["langA"] = CFG["src"] if CFG["src"] != "auto" else "pt"
+                CFG["langB"] = CFG["dst"]
+            restart = True  # -l auto contro -l <lingua>: whisper va riavviato
         if body.get("src") and body["src"] != CFG["src"]:
             CFG["src"] = body["src"]
+            CFG["langA"] = body["src"] if body["src"] != "auto" else CFG["langA"]
             restart = True
         if body.get("dst") and body["dst"] != CFG["dst"]:
             CFG["dst"] = body["dst"]
+            CFG["langB"] = body["dst"]
             _dead.discard("apple")  # la coppia e' cambiata: ridai una chance all'on-device
         if body.get("model") and body["model"] != CFG["model"]:
             CFG["model"] = body["model"]
@@ -500,7 +605,8 @@ class Handler(BaseHTTPRequestHandler):
                         "models": [[k, lbl, f] for k, lbl, f in MODELS
                                    if os.path.exists(os.path.join(HERE, "models", f))],
                         "src": CFG["src"], "dst": CFG["dst"],
-                        "model": CFG["model"], "mic": get_mic()})
+                        "model": CFG["model"], "mic": get_mic(),
+                        "bidi": CFG["bidi"]})
             return
         if self.path == "/history":
             self._json({"rows": load_recent(80)})
@@ -568,9 +674,12 @@ def main() -> int:
     ap.add_argument("--capture", default="1", help="indice device avfoundation")
     ap.add_argument("--model", default="turbo", choices=[k for k, _, _ in MODELS])
     ap.add_argument("--mic", type=int, default=None, help="volume microfono 0-100")
+    ap.add_argument("--bidi", action="store_true",
+                    help="bidirezionale: rileva la lingua e traduce nel verso giusto")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
-    CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture)
+    CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture,
+               bidi=args.bidi, langA=args.src if args.src != "auto" else "pt", langB=args.dst)
 
     if not os.path.exists(WHISPER):
         print("manca whisper-stream: brew install whisper-cpp", file=sys.stderr)
