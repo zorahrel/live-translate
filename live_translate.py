@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Traduzione live dal microfono, mostrata in un overlay nel browser.
+"""Traduzione live dal microfono, con sottotitoli in un overlay del browser.
 
-whisper.cpp (locale, Metal, VAD) -> traduzione -> pagina web via SSE.
-Lingua sorgente e destinazione si cambiano a caldo dall'overlay.
+whisper.cpp (locale, Metal) -> traduzione -> pagina web via SSE.
+Lingue, modello e volume del microfono si cambiano a caldo dall'overlay.
+La cronologia e' persistente su disco (JSONL) e si riapre a ogni avvio.
 
-Uso:  live-translate [--src pt] [--dst it] [--port 8777] [--capture N]
+Uso:  live-translate [--src pt] [--dst it] [--model turbo] [--port 8777]
 """
 import argparse
 import json
@@ -22,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
 WHISPER = "/opt/homebrew/bin/whisper-stream"
+HIST_DIR = os.path.join(HERE, "history")
+os.makedirs(HIST_DIR, exist_ok=True)
 
 ENV_FILE = os.path.expanduser("~/.claude/jarvis/router/.env")
 API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
@@ -40,10 +43,11 @@ HALLUC = {
     "legendas pela comunidade amara.org", "legendas: caption.pt",
     "subtitles by the amara.org community", "thanks for watching",
     "thank you", "grazie", "sottotitoli e revisione a cura di qtss",
+    "sottotitoli creati dalla comunità amara.org", "легенды", "字幕",
 }
 
-# whisper.cpp accetta questi codici; MyMemory usa gli stessi ISO-639-1
 LANGS = [
+    ("auto", "Rileva lingua"),
     ("pt", "Portoghese"), ("it", "Italiano"), ("en", "Inglese"), ("es", "Spagnolo"),
     ("fr", "Francese"), ("de", "Tedesco"), ("nl", "Olandese"), ("ro", "Rumeno"),
     ("pl", "Polacco"), ("ru", "Russo"), ("uk", "Ucraino"), ("tr", "Turco"),
@@ -54,8 +58,17 @@ LANGS = [
     ("vi", "Vietnamita"),
 ]
 LANG_NAME = dict(LANGS)
+DST_LANGS = [(c, n) for c, n in LANGS if c != "auto"]
 
-CFG = {"src": "pt", "dst": "it", "model": "", "capture": "1"}
+# M2 Max, 32 GB: 'turbo' e' il default sensato, gli altri restano per audio difficile o batteria
+MODELS = [
+    ("turbo", "Turbo (migliore)", "ggml-large-v3-turbo-q5_0.bin"),
+    ("small", "Small (bilanciato)", "ggml-small.bin"),
+    ("base", "Base (piu' rapido)", "ggml-base.bin"),
+]
+MODEL_FILE = {k: f for k, _, f in MODELS}
+
+CFG = {"src": "pt", "dst": "it", "model": "turbo", "capture": "1", "mic": 30}
 src_q: "queue.Queue" = queue.Queue()
 subscribers: "list" = []
 sub_lock = threading.Lock()
@@ -63,14 +76,39 @@ stop_flag = threading.Event()
 history: "list" = []
 proc_lock = threading.Lock()
 whisper_proc = None
-gen = 0  # generazione: invalida gli eventi delle sessioni whisper vecchie
+gen = 0
+
+SESSION_FILE = os.path.join(HIST_DIR, time.strftime("%Y-%m-%d_%H%M%S") + ".jsonl")
+hist_lock = threading.Lock()
 
 
-def broadcast(evt: dict) -> None:
-    if evt.get("type") in ("line", "partial"):
-        if evt["type"] == "line":
-            history.append(evt)
-            del history[:-60]
+def persist(evt: dict) -> None:
+    with hist_lock:
+        with open(SESSION_FILE, "a") as fh:
+            fh.write(json.dumps(evt, ensure_ascii=False) + "\n")
+
+
+def load_recent(limit: int = 80) -> list:
+    """Righe delle sessioni precedenti, dalla piu' vecchia alla piu' recente."""
+    files = sorted(f for f in os.listdir(HIST_DIR) if f.endswith(".jsonl"))
+    out: list = []
+    for name in reversed(files):
+        try:
+            with open(os.path.join(HIST_DIR, name)) as fh:
+                rows = [json.loads(l) for l in fh if l.strip()]
+        except Exception:  # noqa: BLE001
+            continue
+        out = rows + out
+        if len(out) >= limit:
+            break
+    return out[-limit:]
+
+
+def broadcast(evt: dict, save: bool = False) -> None:
+    if save:
+        persist(evt)
+        history.append(evt)
+        del history[:-200]
     with sub_lock:
         dead = []
         for q in subscribers:
@@ -105,9 +143,23 @@ def _t_llm(text: str) -> str:
         return json.loads(r.read())["choices"][0]["message"]["content"].strip()
 
 
+def _t_apple(text: str) -> str:
+    """Traduzione on-device di macOS. Nessuna rete, nessuna quota."""
+    src = CFG["src"] if CFG["src"] != "auto" else "und"
+    script = os.path.join(HERE, "apple_translate")
+    if not os.path.exists(script):
+        return ""
+    r = subprocess.run([script, src, CFG["dst"], text], capture_output=True,
+                       text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "apple translate ko").strip()[:80])
+    return r.stdout.strip()
+
+
 def _t_mymemory(text: str) -> str:
+    src = CFG["src"] if CFG["src"] != "auto" else "autodetect"
     url = ("https://api.mymemory.translated.net/get?q=" + urllib.parse.quote(text[:480])
-           + f"&langpair={CFG['src']}|{CFG['dst']}")
+           + f"&langpair={src}|{CFG['dst']}")
     req = urllib.request.Request(url, headers={"User-Agent": "live-translate/1.0"})
     with urllib.request.urlopen(req, timeout=12) as r:
         data = json.loads(r.read())
@@ -117,7 +169,7 @@ def _t_mymemory(text: str) -> str:
     return out
 
 
-BACKENDS = [("cerebras", _t_llm), ("mymemory", _t_mymemory)]
+BACKENDS = [("cerebras", _t_llm), ("apple", _t_apple), ("mymemory", _t_mymemory)]
 _dead: set = set()
 
 
@@ -134,7 +186,7 @@ def translate(text: str):
                 return out, name
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
-            if any(c in msg for c in ("402", "429", "403", "401")):
+            if any(c in msg for c in ("402", "429", "403", "401")) or name == "apple":
                 _dead.add(name)
             errs.append(f"{name}: {msg[:60]}")
     return f"[traduttore non disponibile — {'; '.join(errs)}]", "none"
@@ -163,12 +215,12 @@ def reader_thread(proc, my_gen: int) -> None:
             if piece:
                 buf.append(piece)
     if my_gen == gen and not stop_flag.is_set():
-        broadcast({"type": "status", "state": "off", "text": "cattura audio interrotta"})
+        broadcast({"type": "status", "state": "off", "text": "cattura interrotta"})
 
 
 def translator_thread() -> None:
     last = ""
-    seq = 0
+    seq = int(time.time() * 10) % 100000
     while not stop_flag.is_set():
         try:
             text, g = src_q.get(timeout=0.3)
@@ -179,21 +231,22 @@ def translator_thread() -> None:
         last = text
         seq += 1
         sid = seq
-        # mostra subito l'originale, la traduzione arriva dopo
-        broadcast({"type": "partial", "id": sid, "src": text,
-                   "t": time.strftime("%H:%M:%S")})
+        broadcast({"type": "partial", "id": sid, "src": text, "t": time.strftime("%H:%M:%S")})
         broadcast({"type": "status", "state": "busy", "text": "traduco"})
         t0 = time.time()
         out, backend = translate(text)
         broadcast({"type": "line", "id": sid, "src": text, "dst": out, "backend": backend,
                    "ms": int((time.time() - t0) * 1000), "t": time.strftime("%H:%M:%S"),
-                   "srcLang": CFG["src"], "dstLang": CFG["dst"]})
+                   "srcLang": CFG["src"], "dstLang": CFG["dst"]}, save=True)
         broadcast({"type": "status", "state": "live", "text": "in ascolto"})
 
 
 def start_whisper() -> None:
-    """(Ri)avvia whisper.cpp con la lingua sorgente corrente."""
     global whisper_proc, gen
+    model_path = os.path.join(HERE, "models", MODEL_FILE.get(CFG["model"], "ggml-small.bin"))
+    if not os.path.exists(model_path):
+        broadcast({"type": "status", "state": "off", "text": "modello mancante"})
+        return
     with proc_lock:
         gen += 1
         my_gen = gen
@@ -203,13 +256,30 @@ def start_whisper() -> None:
                 whisper_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 whisper_proc.kill()
-        whisper_proc = subprocess.Popen(
-            [WHISPER, "-m", CFG["model"], "-l", CFG["src"], "--step", "0", "--length", "6000",
-             "-vth", "0.6", "-c", CFG["capture"], "-t", "6"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        # M2 Max: 8 core performance, whisper.cpp gira su Metal per l'encoder
+        cmd = [WHISPER, "-m", model_path, "-l", CFG["src"], "--step", "0", "--length", "6000",
+               "-vth", "0.6", "-c", CFG["capture"], "-t", "8", "-kc"]
+        whisper_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
         threading.Thread(target=reader_thread, args=(whisper_proc, my_gen), daemon=True).start()
     broadcast({"type": "cfg", **CFG})
     broadcast({"type": "status", "state": "live", "text": "in ascolto"})
+
+
+def set_mic(vol: int) -> None:
+    vol = max(0, min(100, int(vol)))
+    CFG["mic"] = vol
+    subprocess.run(["osascript", "-e", f"set volume input volume {vol}"],
+                   capture_output=True)
+
+
+def get_mic() -> int:
+    r = subprocess.run(["osascript", "-e", "input volume of (get volume settings)"],
+                       capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except Exception:  # noqa: BLE001
+        return CFG["mic"]
 
 
 # ------------------------------------------------------------------------ web
@@ -222,101 +292,152 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  body{margin:0;background:#07070b;color:#fff;overflow:hidden;
       font:16px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,sans-serif;
       display:flex;flex-direction:column}
- header{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid #16171f;
+ header{display:flex;align-items:center;gap:9px;padding:9px 14px;border-bottom:1px solid #16171f;
         flex:0 0 auto;flex-wrap:wrap}
  .dot{width:9px;height:9px;border-radius:50%;background:#7de08d;box-shadow:0 0 10px #7de08d;
-      transition:.2s}
+      transition:.2s;flex:0 0 auto}
  .dot.busy{background:#ffd166;box-shadow:0 0 10px #ffd166}
  .dot.off{background:#ff5c5c;box-shadow:0 0 10px #ff5c5c}
- #st{font-size:13px;color:#8a92a6;min-width:78px}
+ #st{font-size:12.5px;color:#8a92a6;min-width:74px}
  .sp{flex:1}
- select{background:#111219;color:#dfe4ee;border:1px solid #23252f;border-radius:7px;
-        padding:5px 8px;font-size:13px;font-family:inherit;cursor:pointer;outline:none}
- select:hover{border-color:#3a3d4d}
+ select,button{background:#111219;color:#c9d1e0;border:1px solid #23252f;border-radius:7px;
+        padding:5px 8px;font-size:12.5px;font-family:inherit;cursor:pointer;outline:none}
+ select:hover,button:hover{border-color:#3a3d4d;color:#fff}
+ button.on{color:#4c8dff;border-color:#2b3a5c;background:#0e1626}
  .arrow{color:#4c5265;font-size:13px}
- button{background:#111219;color:#8a92a6;border:1px solid #23252f;border-radius:7px;
-        padding:5px 10px;font-size:12px;cursor:pointer;font-family:inherit}
- button:hover{color:#fff;border-color:#3a3d4d}
- button.on{color:#4c8dff;border-color:#2b3a5c}
- main{flex:1;overflow-y:auto;padding:18px 22px 10px}
- #log{display:flex;flex-direction:column-reverse;gap:16px}
- .row{border-left:2px solid #1c1e28;padding-left:14px;animation:in .22s ease}
+ /* VU meter */
+ .mic{display:flex;align-items:center;gap:7px;background:#0d0e14;border:1px solid #1c1e26;
+      border-radius:7px;padding:4px 9px}
+ .bars{display:flex;gap:2px;align-items:flex-end;height:15px;width:52px}
+ .bars i{flex:1;background:#22252f;border-radius:1px;height:22%;transition:height .07s,background .12s}
+ .bars i.a{background:#4ade80}.bars i.b{background:#facc15}.bars i.c{background:#f87171}
+ #vol{width:64px;accent-color:#4c8dff;cursor:pointer}
+ #volv{font-size:11px;color:#5c6478;min-width:26px;text-align:right;font-variant-numeric:tabular-nums}
+ main{flex:1;overflow-y:auto;padding:16px 20px 10px}
+ #log{display:flex;flex-direction:column-reverse;gap:15px}
+ .row{border-left:2px solid #1c1e28;padding-left:13px;animation:in .22s ease}
  .row.top{border-left-color:#4c8dff}
  .row.top .it{color:#fff}
- .row.wait .it{color:#5b6273;font-style:italic}
+ .row.wait .it{color:#4e5464}
+ .row.old{opacity:.72}
  @keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
- .it{font-size:28px;font-weight:600;letter-spacing:-.015em;color:#b9c2d4;margin-bottom:3px}
- .pt{font-size:14px;color:#69708291;color:#697082}
+ .sep{font-size:10.5px;color:#3a3f4d;text-transform:uppercase;letter-spacing:.09em;
+      border-top:1px dashed #1c1e28;padding-top:9px;margin-top:3px}
+ .it{font-size:27px;font-weight:600;letter-spacing:-.015em;color:#b9c2d4;margin-bottom:3px}
+ .pt{font-size:13.5px;color:#697082}
  .meta{font-size:10.5px;color:#383d4a;margin-top:3px;letter-spacing:.02em}
- footer{flex:0 0 auto;padding:7px 16px 11px;color:#383d4a;font-size:11px;
-        border-top:1px solid #101119;display:flex;gap:14px}
+ footer{flex:0 0 auto;padding:6px 14px 10px;color:#383d4a;font-size:10.5px;
+        border-top:1px solid #101119;display:flex;gap:12px;align-items:center}
+ footer a{color:#4a5164;text-decoration:none;cursor:pointer}
+ footer a:hover{color:#8a92a6}
  main::-webkit-scrollbar{width:8px}
  main::-webkit-scrollbar-thumb{background:#1a1c24;border-radius:4px}
  body.big .it{font-size:40px}
- body.big .pt{display:none}
+ body.big .pt,body.big .meta{display:none}
 </style></head><body>
 <header>
  <span class="dot" id="d"></span><span id="st">connessione…</span>
  <select id="src" title="lingua parlata"></select>
  <span class="arrow">&rarr;</span>
  <select id="dst" title="traduci in"></select>
+ <select id="mdl" title="modello di trascrizione"></select>
+ <div class="mic" title="livello e volume del microfono">
+   <div class="bars" id="bars"></div>
+   <input type="range" id="vol" min="0" max="100" step="1">
+   <span id="volv">—</span>
+ </div>
  <span class="sp"></span>
  <button id="swap" title="inverti le lingue">&#8646;</button>
  <button id="big" title="testo grande, senza originale">Aa</button>
- <button id="clr" title="pulisci">&#10005;</button>
 </header>
 <main id="m"><div id="log"></div></main>
 <footer><span id="bk">—</span><span class="sp"></span>
- <span>microfono &rarr; whisper.cpp locale &rarr; traduzione</span></footer>
+ <a id="save">salva .txt</a><a id="clr">pulisci vista</a>
+ <span>whisper.cpp locale · cronologia su disco</span></footer>
 <script>
 const $=i=>document.getElementById(i);
-const log=$('log'),d=$('d'),st=$('st'),bk=$('bk'),selS=$('src'),selD=$('dst');
-let LANGS=[],rows=new Map();
+const log=$('log'),d=$('d'),st=$('st'),bk=$('bk'),selS=$('src'),selD=$('dst'),selM=$('mdl');
+let rows=new Map(),LS=[],LD=[];
 
-function fill(sel,cur){sel.innerHTML='';LANGS.forEach(([c,n])=>{
+for(let i=0;i<9;i++)$('bars').appendChild(document.createElement('i'));
+const bars=[...$('bars').children];
+
+function fill(sel,list,cur){sel.innerHTML='';list.forEach(([c,n])=>{
   const o=document.createElement('option');o.value=c;o.textContent=n;
   if(c===cur)o.selected=true;sel.appendChild(o);});}
 
-function rowEl(e){
+function rowEl(e,old){
   let r=rows.get(e.id);
   if(!r){
-    r=document.createElement('div');r.className='row wait';
+    r=document.createElement('div');r.className='row wait'+(old?' old':'');
     r.innerHTML='<div class="it"></div><div class="pt"></div><div class="meta"></div>';
     log.appendChild(r);rows.set(e.id,r);
-    [...log.children].forEach(c=>c.classList.remove('top'));
-    r.classList.add('top');
-    while(log.children.length>60){const old=log.firstChild;log.removeChild(old);}
+    if(!old){[...log.children].forEach(c=>c.classList.remove('top'));r.classList.add('top');
+             r.classList.remove('old');}
+    while(log.children.length>200)log.removeChild(log.firstChild);
   }
   return r;
 }
-function partial(e){
-  const r=rowEl(e);
+function partial(e){const r=rowEl(e);
   r.querySelector('.it').textContent='…';
   r.querySelector('.pt').textContent=e.src;
-  r.querySelector('.meta').textContent=e.t;
-}
-function line(e){
-  const r=rowEl(e);r.classList.remove('wait');
+  r.querySelector('.meta').textContent=e.t;}
+function line(e,old){const r=rowEl(e,old);r.classList.remove('wait');
   r.querySelector('.it').textContent=e.dst;
   r.querySelector('.pt').textContent=e.src;
   r.querySelector('.meta').textContent=e.t+' · '+e.srcLang+'→'+e.dstLang+' · '+e.backend+' · '+e.ms+'ms';
-  bk.textContent=e.backend;
-}
-function post(body){fetch('/cfg',{method:'POST',body:JSON.stringify(body)});}
+  if(!old)bk.textContent=e.backend;}
+function post(b){return fetch('/cfg',{method:'POST',body:JSON.stringify(b)});}
+
 selS.onchange=()=>post({src:selS.value});
 selD.onchange=()=>post({dst:selD.value});
-$('swap').onclick=()=>post({src:selD.value,dst:selS.value});
+selM.onchange=()=>post({model:selM.value});
+$('swap').onclick=()=>{if(selD.value!=='auto')post({src:selD.value,dst:selS.value==='auto'?'it':selS.value});};
 $('big').onclick=e=>{document.body.classList.toggle('big');e.target.classList.toggle('on');};
 $('clr').onclick=()=>{log.innerHTML='';rows.clear();};
+$('save').onclick=()=>{window.open('/export','_blank');};
 
-fetch('/langs').then(r=>r.json()).then(j=>{LANGS=j.langs;fill(selS,j.src);fill(selD,j.dst);});
+let volT;
+$('vol').oninput=e=>{$('volv').textContent=e.target.value;
+  clearTimeout(volT);volT=setTimeout(()=>post({mic:+e.target.value}),160);};
+
+// VU meter: stream indipendente, non contende il device a whisper
+navigator.mediaDevices?.getUserMedia({audio:{echoCancellation:false,autoGainControl:false,
+    noiseSuppression:false}}).then(s=>{
+  const ac=new AudioContext(),an=ac.createAnalyser();
+  an.fftSize=1024;an.smoothingTimeConstant=.55;
+  ac.createMediaStreamSource(s).connect(an);
+  const buf=new Uint8Array(an.fftSize);
+  (function tick(){
+    an.getByteTimeDomainData(buf);
+    let p=0;for(let i=0;i<buf.length;i++){const v=Math.abs(buf[i]-128);if(v>p)p=v;}
+    const lvl=Math.min(1,p/70);
+    bars.forEach((b,i)=>{const on=lvl>(i+.6)/bars.length;
+      b.style.height=(on?22+78*Math.min(1,(lvl-(i/bars.length))*3.2):22)+'%';
+      b.className=on?(i>6?'c':i>4?'b':'a'):'';});
+    requestAnimationFrame(tick);})();
+}).catch(()=>{$('bars').style.opacity=.25;$('bars').title='permesso microfono negato al browser';});
+
+fetch('/langs').then(r=>r.json()).then(j=>{
+  LS=j.langs;LD=j.dstLangs;
+  fill(selS,LS,j.src);fill(selD,LD,j.dst);
+  fill(selM,j.models.map(m=>[m[0],m[1]]),j.model);
+  $('vol').value=j.mic;$('volv').textContent=j.mic;});
+
+fetch('/history').then(r=>r.json()).then(j=>{
+  if(!j.rows.length)return;
+  j.rows.forEach(e=>line(e,true));
+  const s=document.createElement('div');s.className='sep';
+  s.textContent='— sessioni precedenti sopra · nuove qui sotto —';
+  log.appendChild(s);});
 
 const es=new EventSource('/events');
 es.onmessage=ev=>{const e=JSON.parse(ev.data);
   if(e.type==='line')line(e);
   else if(e.type==='partial')partial(e);
-  else if(e.type==='cfg'){if(LANGS.length){fill(selS,e.src);fill(selD,e.dst);}}
-  else if(e.type==='clear'){log.innerHTML='';rows.clear();}
+  else if(e.type==='cfg'){fill(selS,LS,e.src);fill(selD,LD,e.dst);
+    if(selM.options.length)selM.value=e.model;
+    $('vol').value=e.mic;$('volv').textContent=e.mic;}
   else if(e.type==='status'){d.className='dot '+(e.state==='live'?'':e.state);st.textContent=e.text;}
 };
 es.onerror=()=>{d.className='dot off';st.textContent='disconnesso';};
@@ -330,9 +451,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _json(self, obj, code=200):
-        body = json.dumps(obj).encode()
+        body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -352,11 +473,15 @@ class Handler(BaseHTTPRequestHandler):
             restart = True
         if body.get("dst") and body["dst"] != CFG["dst"]:
             CFG["dst"] = body["dst"]
-        self._json({"ok": True, "src": CFG["src"], "dst": CFG["dst"]})
-        broadcast({"type": "clear"})
-        history.clear()
+            _dead.discard("apple")  # la coppia e' cambiata: ridai una chance all'on-device
+        if body.get("model") and body["model"] != CFG["model"]:
+            CFG["model"] = body["model"]
+            restart = True
+        if body.get("mic") is not None:
+            set_mic(body["mic"])
+        self._json({"ok": True, **CFG})
         if restart:
-            broadcast({"type": "status", "state": "busy", "text": "cambio lingua…"})
+            broadcast({"type": "status", "state": "busy", "text": "riavvio…"})
             threading.Thread(target=start_whisper, daemon=True).start()
         else:
             broadcast({"type": "cfg", **CFG})
@@ -371,7 +496,27 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == "/langs":
-            self._json({"langs": LANGS, "src": CFG["src"], "dst": CFG["dst"]})
+            self._json({"langs": LANGS, "dstLangs": DST_LANGS,
+                        "models": [[k, lbl, f] for k, lbl, f in MODELS
+                                   if os.path.exists(os.path.join(HERE, "models", f))],
+                        "src": CFG["src"], "dst": CFG["dst"],
+                        "model": CFG["model"], "mic": get_mic()})
+            return
+        if self.path == "/history":
+            self._json({"rows": load_recent(80)})
+            return
+        if self.path == "/export":
+            rows = load_recent(500)
+            txt = "\n".join(f"[{r.get('t','')}] {r.get('dst','')}\n           {r.get('src','')}"
+                            for r in rows)
+            body = ("Trascrizione live-translate\n" + "=" * 40 + "\n\n" + txt).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="live-translate.txt"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path == "/events":
             self.send_response(200)
@@ -379,14 +524,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            q: queue.Queue = queue.Queue(maxsize=300)
+            q: queue.Queue = queue.Queue(maxsize=400)
             with sub_lock:
                 subscribers.append(q)
             try:
                 self._ev({"type": "cfg", **CFG})
                 self._ev({"type": "status", "state": "live", "text": "in ascolto"})
-                for evt in history[-15:]:
-                    self._ev(evt)
                 while not stop_flag.is_set():
                     try:
                         self._ev(q.get(timeout=10))
@@ -403,14 +546,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def _ev(self, evt):
-        self.wfile.write(b"data: " + json.dumps(evt).encode() + b"\n\n")
+        self.wfile.write(b"data: " + json.dumps(evt, ensure_ascii=False).encode() + b"\n\n")
         self.wfile.flush()
 
 
 def open_window(url: str) -> None:
     for app in ("Google Chrome", "Microsoft Edge", "Brave Browser"):
         r = subprocess.run(["open", "-na", app, "--args", f"--app={url}",
-                            "--window-size=980,440", "--window-position=380,560"],
+                            "--window-size=1020,470", "--window-position=340,520"],
                            capture_output=True)
         if r.returncode == 0:
             return
@@ -420,30 +563,32 @@ def open_window(url: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8777)
-    ap.add_argument("--src", default="pt", help="lingua parlata (ISO-639-1)")
-    ap.add_argument("--dst", default="it", help="lingua di destinazione")
-    ap.add_argument("--capture", default="1", help="indice device audio avfoundation")
-    ap.add_argument("--model", default=os.path.join(HERE, "models", "ggml-small.bin"))
+    ap.add_argument("--src", default="pt", help="lingua parlata, o 'auto'")
+    ap.add_argument("--dst", default="it")
+    ap.add_argument("--capture", default="1", help="indice device avfoundation")
+    ap.add_argument("--model", default="turbo", choices=[k for k, _, _ in MODELS])
+    ap.add_argument("--mic", type=int, default=None, help="volume microfono 0-100")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture)
 
-    if not os.path.exists(args.model):
-        print(f"modello mancante: {args.model}", file=sys.stderr)
-        return 2
     if not os.path.exists(WHISPER):
-        print("whisper-stream mancante: brew install whisper-cpp", file=sys.stderr)
+        print("manca whisper-stream: brew install whisper-cpp", file=sys.stderr)
         return 2
+    if args.mic is not None:
+        set_mic(args.mic)
+    else:
+        CFG["mic"] = get_mic()
 
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-
     threading.Thread(target=translator_thread, daemon=True).start()
     start_whisper()
 
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"overlay: {url}   ({CFG['src']} -> {CFG['dst']})")
+    print(f"overlay: {url}   {CFG['src']} -> {CFG['dst']}   modello {CFG['model']}")
+    print(f"cronologia: {SESSION_FILE}")
     if not args.no_open:
         open_window(url)
     try:
