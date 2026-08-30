@@ -1,0 +1,7 @@
+#!/bin/bash
+# Traduzione live dal microfono. Uso: live-translate [--src pt] [--dst it] [--capture N]
+cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" || exit 1
+pkill -f 'live_translate.py' 2>/dev/null
+pkill -f whisper-stream 2>/dev/null
+sleep 0.5
+exec python3 live_translate.py "$@"
