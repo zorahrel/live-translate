@@ -93,23 +93,106 @@ STOPWORDS = {
 }
 
 
-def guess_lang(text: str, candidates) -> str:
-    """Rilevamento a stopword fra le sole lingue candidate. '' se e' indeciso."""
-    words = re.findall(r"[a-zà-ÿ]+", text.lower())
-    if len(words) < 4:
-        return ""
+# marcatori esclusivi: se compaiono, la lingua e' praticamente certa
+EXCLUSIVE = {
+    "pt": {"você", "voce", "não", "então", "muito", "tá", "está", "são", "coisas", "duas",
+           "gente", "pra", "nós", "eles", "isso", "aqui", "mais", "já", "ção", "ões", "nh",
+           "oi", "obrigado", "obrigada", "tudo", "bom", "legal", "cara", "amigo", "amiga",
+           "vamos", "quero", "fazer", "agora", "sempre", "nunca", "porque", "quando"},
+    "it": {"perché", "però", "così", "più", "gli", "della", "delle", "nella", "sono", "anche",
+           "quello", "questa", "cosa", "essere", "doppia", "traduzione", "che", "sia",
+           "ciao", "stai", "sei", "siamo", "vado", "faccio", "voglio", "adesso", "bene",
+           "grazie", "prego", "certo", "vero", "niente", "sempre", "ancora", "dopo"},
+    "es": {"pero", "porque", "también", "está", "esto", "muy", "hacer", "ellos", "señor"},
+    "en": {"the", "this", "with", "have", "what", "because", "would", "should"},
+    "fr": {"c'est", "pour", "avec", "être", "cette", "aussi", "parce"},
+}
+# sequenze di lettere che una lingua ha e l'altra no
+NGRAMS = {
+    "pt": ("ão", "õe", "ç", "nh", "lh", "ê", "â"),
+    "it": ("gli", "gn", "cchi", "zione", "à ", "ù"),
+    "es": ("ñ", "¿", "¡", "ll"),
+}
+
+
+def score_lang(text: str, candidates) -> dict:
+    """Punteggio grezzo per lingua: stopword + marcatori esclusivi + n-grammi."""
+    low = text.lower()
+    words = re.findall(r"[a-zà-ÿ']+", low)
     scores = {}
     for c in candidates:
-        sw = STOPWORDS.get(c)
-        if sw:
-            scores[c] = sum(1 for w in words if w in sw)
+        sc = sum(1 for w in words if w in STOPWORDS.get(c, ()))
+        sc += 2 * sum(1 for w in words if w in EXCLUSIVE.get(c, ()))
+        sc += 2 * sum(1 for g in NGRAMS.get(c, ()) if g in low)
+        scores[c] = sc
+    return scores
+
+
+def guess_lang(text: str, candidates, min_words: int = 4, margin: int = 2) -> str:
+    """Rilevamento a stopword fra le sole lingue candidate. '' se e' indeciso."""
+    words = re.findall(r"[a-zà-ÿ']+", text.lower())
+    if len(words) < min_words:
+        return ""
+    scores = score_lang(text, candidates)
     if not scores:
         return ""
     best = max(scores, key=scores.get)
     ranked = sorted(scores.values(), reverse=True)
-    if ranked[0] == 0 or (len(ranked) > 1 and ranked[0] - ranked[1] < 2):
+    if ranked[0] == 0 or (len(ranked) > 1 and ranked[0] - ranked[1] < margin):
         return ""
     return best
+
+
+# taglia su punteggiatura forte, ma anche dove il parlato cambia turno
+SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|\s*[–—]\s+|\s{3,}")
+
+
+def segment(text: str) -> list:
+    """Spezza in unita' abbastanza lunghe da poter essere riconosciute."""
+    parts = [p.strip() for p in SPLIT_RE.split(text) if p and p.strip()]
+    if len(parts) <= 1:
+        return [text.strip()]
+    # riattacca i frammenti troppo corti al precedente: da soli non si riconoscono
+    out: list = []
+    for p in parts:
+        if out and len(re.findall(r"[a-zà-ÿ']+", p)) < 3:
+            out[-1] = out[-1] + " " + p
+        else:
+            out.append(p)
+    return out
+
+
+def split_by_language(text: str, a: str, b: str) -> list:
+    """Divide una frase mista in blocchi [(testo, lingua)], accorpando i vicini uguali.
+
+    Serve quando due voci si accavallano e whisper le fonde in un chunk solo.
+    Se non trova almeno due lingue diverse con certezza, ritorna un blocco solo:
+    spezzare a caso una frase monolingue la peggiora.
+    """
+    segs = segment(text)
+    if len(segs) < 2:
+        return [(text.strip(), "")]
+    tagged = []
+    for sg in segs:
+        # soglia piu' bassa: qui i pezzi sono corti per costruzione
+        tagged.append((sg, guess_lang(sg, (a, b), min_words=2, margin=2)))
+    found = {l for _, l in tagged if l}
+    if len(found) < 2:
+        return [(text.strip(), "")]
+    # i segmenti indecisi ereditano la lingua del vicino gia' etichettato
+    for i, (sg, l) in enumerate(tagged):
+        if l:
+            continue
+        prev = next((tagged[j][1] for j in range(i - 1, -1, -1) if tagged[j][1]), "")
+        nxt = next((tagged[j][1] for j in range(i + 1, len(tagged)) if tagged[j][1]), "")
+        tagged[i] = (sg, prev or nxt)
+    merged: list = []
+    for sg, l in tagged:
+        if merged and merged[-1][1] == l:
+            merged[-1] = (merged[-1][0] + " " + sg, l)
+        else:
+            merged.append((sg, l))
+    return merged
 src_q: "queue.Queue" = queue.Queue()
 subscribers: "list" = []
 sub_lock = threading.Lock()
@@ -287,15 +370,35 @@ def translator_thread() -> None:
         last = text
         seq += 1
         sid = seq
-        src_l, dst_l, how = route(text)
-        broadcast({"type": "partial", "id": sid, "src": text, "srcLang": src_l,
-                   "dstLang": dst_l, "t": time.strftime("%H:%M:%S")})
+        broadcast({"type": "partial", "id": sid, "src": text, "t": time.strftime("%H:%M:%S")})
         broadcast({"type": "status", "state": "busy", "text": "traduco"})
-        t0 = time.time()
-        out, backend = translate(text, src_l, dst_l)
-        broadcast({"type": "line", "id": sid, "src": text, "dst": out, "backend": backend,
-                   "ms": int((time.time() - t0) * 1000), "t": time.strftime("%H:%M:%S"),
-                   "srcLang": src_l, "dstLang": dst_l, "how": how}, save=True)
+
+        # due voci accavallate finiscono in un chunk solo: se dentro ci sono
+        # davvero due lingue, si traduce pezzo per pezzo
+        blocks = [(text, "")]
+        if CFG["bidi"]:
+            blocks = split_by_language(text, CFG["langA"], CFG["langB"])
+
+        for bi, (btext, blang) in enumerate(blocks):
+            bid = sid if bi == 0 else f"{sid}.{bi}"
+            if blang:
+                src_l = blang
+                dst_l = CFG["langB"] if blang == CFG["langA"] else CFG["langA"]
+                how = "misto"
+            else:
+                src_l, dst_l, how = route(btext)
+            if len(blocks) > 1 and bi > 0:
+                broadcast({"type": "partial", "id": bid, "src": btext,
+                           "t": time.strftime("%H:%M:%S")})
+            if how.startswith("scartato"):
+                continue
+            t0 = time.time()
+            out, backend = translate(btext, src_l, dst_l)
+            broadcast({"type": "line", "id": bid, "src": btext, "dst": out, "backend": backend,
+                       "ms": int((time.time() - t0) * 1000), "t": time.strftime("%H:%M:%S"),
+                       "srcLang": src_l, "dstLang": dst_l, "how": how,
+                       "part": f"{bi + 1}/{len(blocks)}" if len(blocks) > 1 else ""},
+                      save=True)
         broadcast({"type": "status", "state": "live", "text": "in ascolto"})
 
 
@@ -313,7 +416,11 @@ def route(text: str):
         code, prob, at = det_lang["code"], det_lang["p"], det_lang["at"]
     if code in (a, b) and prob >= 0.5 and time.time() - at < 25:
         return (a, b, f"whisper {prob:.0%}") if code == a else (b, a, f"whisper {prob:.0%}")
-    # 3. in dubbio si tiene la direzione principale: meglio non tradurre che invertire a caso
+    # 3. whisper puo' cadere su una lingua terza sul rumore ('Bez bez beri yapı dar'
+    #    rilevato turco): quel chunk non e' parlato utile, non va tradotto
+    if code and code not in (a, b) and prob >= 0.5 and time.time() - at < 25:
+        return a, b, f"scartato:{code}"
+    # 4. in dubbio si tiene la direzione principale: meglio non tradurre che invertire a caso
     return a, b, "default"
 
 
@@ -419,6 +526,8 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  body.bidi .row.rev{border-left-color:#c084fc;margin-left:38px}
  body.bidi .row.rev.top{border-left-color:#e0a3ff}
  body.bidi .row.rev .it{color:#e9d5ff}
+ .row.part{border-left-style:dashed}
+ .row.part .it{font-size:23px}
  body.bidi .row.rev.top .it{color:#faf5ff}
 </style></head><body>
 <header>
@@ -473,7 +582,9 @@ function line(e,old){const r=rowEl(e,old);r.classList.remove('wait');
   r.querySelector('.it').textContent=e.dst;
   r.querySelector('.pt').textContent=e.src;
   r.querySelector('.meta').textContent=e.t+' · '+e.srcLang+'→'+e.dstLang
-    +(e.how&&e.how!=='fisso'?' ('+e.how+')':'')+' · '+e.backend+' · '+e.ms+'ms';
+    +(e.how&&e.how!=='fisso'?' ('+e.how+')':'')+(e.part?' · pezzo '+e.part:'')
+    +' · '+e.backend+' · '+e.ms+'ms';
+  if(e.part)r.classList.add('part');
   r.dataset.dir=e.srcLang;
   if(e.srcLang===selD.value&&document.body.classList.contains('bidi'))r.classList.add('rev');
   if(!old)bk.textContent=e.backend;}

@@ -23,6 +23,28 @@ La direzione si decide in cascata, e ogni riga dichiara nei metadati come:
 In bidi whisper perde `-kc` (contesto fra chunk): su due lingue alternate il
 contesto lo spinge a restare in quella precedente.
 
+### Frasi miste
+Quando due voci si accavallano whisper le fonde in un chunk solo, e nella
+stessa riga finiscono entrambe le lingue: nella cronologia c'e' il caso vero
+`"Fala a doppia traduzione. Traduz as duas coisas."`. In bidi ogni chunk viene
+quindi spezzato su punteggiatura forte e ogni pezzo etichettato per conto suo;
+i pezzi contigui della stessa lingua si riaccorpano, quelli indecisi ereditano
+dal vicino. Se non risultano almeno **due** lingue diverse con certezza, la
+riga resta intera: spezzare una frase monolingue la peggiora e basta.
+I pezzi appaiono come righe separate, bordo tratteggiato e `pezzo 1/2`.
+
+Su 10 casi (5 misti, 5 monolingui): 10/10, nessuna frase intera spezzata a
+torto. Il rilevamento sui pezzi corti usa, oltre alle stopword, marcatori
+esclusivi (`você`, `perché`, `gli`) e n-grammi impossibili nell'altra lingua
+(`ão`, `nh`, `gn`, `zione`).
+
+### Rumore rilevato come lingua terza
+Con `-l auto` il rumore di fondo diventa a volte una lingua a caso: dal vivo e'
+uscito `"Bez bez beri yapı dar bir daha"` rilevato turco al 55%. Se whisper e'
+sicuro di una lingua che non e' nessuna delle due del dialogo, il chunk viene
+scartato invece di essere tradotto: prima passava intatto attraverso il
+traduttore e sporcava la cronologia.
+
 Si apre una finestra sopra le altre: traduzione grande, originale sotto.
 Dalla barra si cambiano a caldo **lingua sorgente, lingua di arrivo, modello e
 volume del microfono**; il VU meter accanto allo slider dice se il mic sta
