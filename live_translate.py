@@ -1029,6 +1029,7 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
       transition:.2s;flex:0 0 auto}
  .dot.busy{background:#ffd166;box-shadow:0 0 10px #ffd166}
  .dot.off{background:#ff5c5c;box-shadow:0 0 10px #ff5c5c}
+ .dot.speak{background:#4c8dff;box-shadow:0 0 10px #4c8dff}
  #st{font-size:12.5px;color:#8a92a6;min-width:74px}
  .sp{flex:1}
  select,button{background:#111219;color:#c9d1e0;border:1px solid #23252f;border-radius:7px;
@@ -1306,10 +1307,10 @@ fetch('/history').then(r=>r.json()).then(j=>{
 const es=new EventSource('/events');
 es.onmessage=ev=>{const e=JSON.parse(ev.data);
   if(e.type==='line'){line(e);liveClear(e.id);}
-  else if(e.type==='live')liveShow(e);
+  else if(e.type==='live'){liveShow(e);d.className='dot speak';}
   else if(e.type==='livedst')liveTrans(e);
   else if(e.type==='improve')improve(e);
-  else if(e.type==='drop')liveClear(e.id);
+  else if(e.type==='drop'){liveClear(e.id);d.className='dot';}
   else if(e.type==='partial')partial(e);
   else if(e.type==='cfg'){fill(selS,LS,e.src);fill(selD,LD,e.dst);
     if(selM.options.length)selM.value=e.model;
