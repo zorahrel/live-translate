@@ -444,9 +444,11 @@ def stderr_thread(proc, my_gen: int) -> None:
                 det_lang.update(code=m.group(1), p=float(m.group(2)), at=time.time())
 
 
-STABLE_AFTER = 1.4    # secondi senza revisioni prima di considerare chiusa una frase
+STABLE_AFTER = 1.1    # pausa dopo cui la frase e' considerata chiusa
 MIN_WORDS = 3         # sotto questa soglia si aspetta: tradurre 'vezes do' non serve
 PREVIEW_EVERY = 1.2   # intervallo minimo fra due traduzioni provvisorie
+MAX_OPEN = 4.0        # oltre questo un segmento va chiuso comunque
+MAX_WORDS_OPEN = 14   # ...o quando e' diventato abbastanza lungo da bastare
 
 
 def stream_reader(proc, my_gen: int) -> None:
@@ -457,25 +459,39 @@ def stream_reader(proc, my_gen: int) -> None:
     ('vezes do' -> 'as vezes do trabalho dele' -> ...) e tradurre ogni
     revisione produce frammenti inutili e brucia quota.
     """
-    state = {"cur": "", "seg": 0, "last_change": 0.0, "sent": ""}
+    state = {"cur": "", "seg": 0, "last_change": 0.0, "sent": "", "opened": 0.0}
     lock = threading.Lock()
 
     def flusher():
+        """Decide quando una frase e' finita.
+
+        La sola pausa non basta: con due persone che parlano senza respiro il
+        silenzio di 1.1s non arriva mai, e in 25 secondi di conversazione
+        veniva salvata una riga sola su 32 revisioni. Quindi si chiude anche
+        per durata o per lunghezza, cosi' il flusso continuo viene comunque
+        spezzato in frasi utilizzabili.
+        """
         while not stop_flag.is_set() and my_gen == gen:
-            time.sleep(0.25)
+            time.sleep(0.2)
             with lock:
                 cur, lc, sent = state["cur"], state["last_change"], state["sent"]
+                opened = state["opened"]
                 if not cur or cur == sent or not lc:
                     continue
-                if time.time() - lc < STABLE_AFTER:
+                nwords = len(re.findall(r"[\wà-ÿ']+", cur))
+                if nwords < MIN_WORDS:
                     continue
-                if len(re.findall(r"[\wà-ÿ']+", cur)) < MIN_WORDS:
+                quiet = time.time() - lc >= STABLE_AFTER
+                too_long = time.time() - opened >= MAX_OPEN
+                too_big = nwords >= MAX_WORDS_OPEN
+                if not (quiet or too_long or too_big):
                     continue
                 state["sent"] = cur
                 seg = state["seg"]
                 state["seg"] += 1
                 state["cur"] = ""
                 state["last_change"] = 0.0
+                state["opened"] = 0.0
             emit_final(cur, my_gen, seg)
 
     threading.Thread(target=flusher, daemon=True).start()
@@ -535,6 +551,8 @@ def stream_reader(proc, my_gen: int) -> None:
                     continue
                 state["cur"] = txt
                 state["last_change"] = time.time()
+                if not state["opened"]:
+                    state["opened"] = time.time()
                 seg = state["seg"]
             broadcast({"type": "live", "id": f"{my_gen}.{seg}", "src": txt,
                        "t": time.strftime("%H:%M:%S")})
@@ -550,6 +568,8 @@ def stream_reader(proc, my_gen: int) -> None:
                     continue
                 state["cur"] = txt
                 state["last_change"] = time.time()
+                if not state["opened"]:
+                    state["opened"] = time.time()
                 seg = state["seg"]
             broadcast({"type": "live", "id": f"{my_gen}.{seg}", "src": txt,
                        "t": time.strftime("%H:%M:%S")})
@@ -557,11 +577,52 @@ def stream_reader(proc, my_gen: int) -> None:
         broadcast({"type": "status", "state": "off", "text": "cattura interrotta"})
 
 
+_last_final = {"text": ""}
+
+
+def _dedup(text: str, prev: str) -> str:
+    """Toglie da `text` la coda di `prev` che si ripete.
+
+    In sliding window la finestra successiva contiene ancora parte della frase
+    gia' chiusa, quindi senza questo la stessa mezza frase verrebbe salvata e
+    tradotta due volte.
+    """
+    if not prev:
+        return text
+    pw, tw = prev.split(), text.split()
+    if not pw or not tw:
+        return text
+    norm = lambda ws: [w.lower().strip(".,!?;:\"'…-") for w in ws]  # noqa: E731
+    pn, tn = norm(pw), norm(tw)
+    best = 0
+    for k in range(min(len(pn), len(tn)), 2, -1):
+        if pn[-k:] == tn[:k]:
+            best = k
+            break
+    if not best:
+        # whisper riformula mentre rivede ('tu morar sozinha' -> 'morar
+        # sozinha'), quindi il confronto letterale non basta: se quasi tutte
+        # le parole erano gia' nella riga precedente e' la stessa frase
+        if len(tn) <= len(pn) + 2:
+            common = len(set(tn) & set(pn))
+            if common >= max(3, int(len(set(tn)) * 0.75)):
+                return ""
+        if len(tn) <= len(pn) and " ".join(tn) in " ".join(pn):
+            return ""
+        return text
+    return " ".join(tw[best:]).strip()
+
+
 def emit_final(text: str, my_gen: int, seg_id: int) -> None:
     t = text.strip()
     if not t or NOISE_RE.match(t) or t.lower().strip(" .!?,") in HALLUC:
         broadcast({"type": "drop", "id": f"{my_gen}.{seg_id}"})
         return
+    t = _dedup(t, _last_final["text"])
+    if not t or len(re.findall(r"[\wà-ÿ']+", t)) < MIN_WORDS:
+        broadcast({"type": "drop", "id": f"{my_gen}.{seg_id}"})
+        return
+    _last_final["text"] = t
     src_q.put((t, my_gen, f"{my_gen}.{seg_id}"))
 
 
