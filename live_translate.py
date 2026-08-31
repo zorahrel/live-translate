@@ -207,7 +207,26 @@ proc_lock = threading.Lock()
 whisper_proc = None
 gen = 0
 
-SESSION_FILE = os.path.join(HIST_DIR, time.strftime("%Y-%m-%d_%H%M%S") + ".jsonl")
+def _session_file(resume_within: int = 1800) -> str:
+    """Riusa l'ultimo file se e' stato scritto da poco, altrimenti ne apre uno.
+
+    Un riavvio dell'app in mezzo a una conversazione non e' una sessione nuova:
+    spezzare li' la cronologia significa perdere di vista quello che si stava
+    appena trascrivendo.
+    """
+    try:
+        files = [f for f in os.listdir(HIST_DIR) if f.endswith(".jsonl")]
+        if files:
+            newest = max(files, key=lambda f: os.path.getmtime(os.path.join(HIST_DIR, f)))
+            path = os.path.join(HIST_DIR, newest)
+            if time.time() - os.path.getmtime(path) < resume_within:
+                return path
+    except Exception:  # noqa: BLE001
+        pass
+    return os.path.join(HIST_DIR, time.strftime("%Y-%m-%d_%H%M%S") + ".jsonl")
+
+
+SESSION_FILE = _session_file()
 hist_lock = threading.Lock()
 
 
@@ -217,11 +236,25 @@ def persist(evt: dict) -> None:
             fh.write(json.dumps(evt, ensure_ascii=False) + "\n")
 
 
-def load_recent(limit: int = 80) -> list:
-    """Righe delle sessioni precedenti, dalla piu' vecchia alla piu' recente."""
-    files = sorted(f for f in os.listdir(HIST_DIR) if f.endswith(".jsonl"))
+def load_recent(limit: int = 400) -> list:
+    """Righe gia' trascritte, dalla piu' vecchia alla piu' recente.
+
+    La sessione in corso viene restituita intera: e' quella che l'utente si
+    aspetta di ritrovare riaprendo la finestra. Le precedenti riempiono il
+    resto fino a `limit`.
+    """
     out: list = []
-    for name in reversed(files):
+    with hist_lock:
+        try:
+            with open(SESSION_FILE) as fh:
+                out = [json.loads(l) for l in fh if l.strip()]
+        except Exception:  # noqa: BLE001
+            out = []
+    if len(out) >= limit:
+        return out[-limit:]
+    others = sorted(f for f in os.listdir(HIST_DIR)
+                    if f.endswith(".jsonl") and os.path.join(HIST_DIR, f) != SESSION_FILE)
+    for name in reversed(others):
         try:
             with open(os.path.join(HIST_DIR, name)) as fh:
                 rows = [json.loads(l) for l in fh if l.strip()]
@@ -778,7 +811,7 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
    animation:blink 1s steps(2) infinite;flex:0 0 auto;border-radius:1px}
  @keyframes blink{50%{opacity:0}}
  main{flex:1;overflow-y:auto;padding:16px 20px 10px}
- #log{display:flex;flex-direction:column-reverse;gap:15px}
+ #log{display:flex;flex-direction:column;gap:15px}
  .row{border-left:2px solid #1c1e28;padding-left:13px;animation:in .22s ease}
  .row.top{border-left-color:#4c8dff}
  .row.top .it{color:#fff}
@@ -853,8 +886,14 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  <span>whisper.cpp locale · cronologia su disco</span></footer>
 <script>
 const $=i=>document.getElementById(i);
+// resta agganciato in fondo, ma solo finche' l'utente non scorre indietro
+// per rileggere: in quel caso le righe nuove non devono strappargli la vista
+let stick=true;
 const log=$('log'),d=$('d'),st=$('st'),bk=$('bk'),selS=$('src'),selD=$('dst'),selM=$('mdl');
 let rows=new Map(),LS=[],LD=[];
+
+$('m').addEventListener('scroll',()=>{
+  const el=$('m');stick=el.scrollHeight-el.scrollTop-el.clientHeight<40;});
 
 for(let i=0;i<9;i++)$('bars').appendChild(document.createElement('i'));
 const bars=[...$('bars').children];
@@ -877,8 +916,12 @@ function rowEl(e,old){
         {text:d.dataset.dst||'',lang:d.dataset.dstlang||''})});};
     log.appendChild(r);rows.set(e.id,r);
     if(!old){[...log.children].forEach(c=>c.classList.remove('top'));r.classList.add('top');
-             r.classList.remove('old');}
-    while(log.children.length>200)log.removeChild(log.firstChild);
+             r.classList.remove('old');
+             if(stick)requestAnimationFrame(()=>{$('m').scrollTop=$('m').scrollHeight;});}
+    while(log.children.length>200){
+      const g=log.firstChild;
+      for(const [k,v] of rows) if(v===g){rows.delete(k);break;}
+      log.removeChild(g);}
   }
   return r;
 }
@@ -966,8 +1009,9 @@ fetch('/history').then(r=>r.json()).then(j=>{
   if(!j.rows.length)return;
   j.rows.forEach(e=>line(e,true));
   const s=document.createElement('div');s.className='sep';
-  s.textContent='— sessioni precedenti sopra · nuove qui sotto —';
-  log.appendChild(s);});
+  s.textContent='— righe precedenti sopra · nuove qui sotto —';
+  log.appendChild(s);
+  requestAnimationFrame(()=>{$('m').scrollTop=$('m').scrollHeight;});});
 
 const es=new EventSource('/events');
 es.onmessage=ev=>{const e=JSON.parse(ev.data);
@@ -1082,7 +1126,7 @@ class Handler(BaseHTTPRequestHandler):
                         "voices": sorted(VOICES)})
             return
         if self.path == "/history":
-            self._json({"rows": load_recent(80)})
+            self._json({"rows": load_recent(400)})
             return
         if self.path == "/export":
             rows = load_recent(500)
