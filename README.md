@@ -96,37 +96,6 @@ spezzato sulla punteggiatura e ogni pezzo etichettato per conto suo; si divide
 **solo** se emergono almeno due lingue diverse con certezza, perché spezzare una
 frase monolingue la peggiora. Su 10 casi (5 misti, 5 no): 10/10.
 
-## Parlargli per farlo cambiare
-
-Il pulsante col microfono accende l'auto-miglioramento. Da lì una frase che
-inizia con il suo nome non viene tradotta, viene **eseguita**:
-
-> *"Live Translate, il testo è troppo piccolo"*
-> *"ehi porto, non leggere le righe corte"*
-
-La richiesta arriva a un agente che modifica il codice, e una banda in alto
-mostra cosa sta facendo. Riconosce `live translate`, `porto`, `jarvis`,
-`computer`, `app`.
-
-Il richiamo serve a distinguere: senza, ogni frase davanti al microfono sarebbe
-un ordine, e questo software esiste per ascoltare conversazioni. Su otto prove,
-quattro comandi e quattro frasi normali, nessun errore in nessuna direzione.
-
-Modificarsi da soli senza rete è un modo per perdere il lavoro, quindi:
-
-- si parte **solo da un albero pulito**, altrimenti annullare cancellerebbe
-  anche modifiche che non ha fatto l'agente;
-- la modifica si tiene solo se il server **continua a partire e a rispondere**
-  su una porta di prova, altrimenti si torna indietro e si dice perché;
-- ogni cambiamento è un commit separato che riporta la frase dettata, quindi
-  `git log` racconta cosa hai chiesto e `git revert` lo annulla.
-
-Con l'auto-miglioramento acceso whisper passa in riconoscimento automatico della
-lingua: i comandi si danno in italiano anche mentre trascrive altro.
-
-Requisito: la CLI `claude` installata. Senza, il pulsante lo dice invece di
-fallire in silenzio.
-
 ## Cronologia
 
 Ogni riga finisce in `history/<data>.jsonl` mentre appare a schermo, quindi
