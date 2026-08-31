@@ -17,7 +17,7 @@ passa resta scritto su disco.
 ## Installazione
 
 ```bash
-git clone https://github.com/USER/live-translate
+git clone https://github.com/zorahrel/live-translate
 cd live-translate
 ./setup.sh          # whisper.cpp, modello, traduttore locale, app
 open LiveTranslate.app
