@@ -541,8 +541,8 @@ def stream_reader(proc, my_gen: int) -> None:
                 continue
             if len(re.findall(r"[\wà-ÿ']+", cur)) < MIN_WORDS:
                 continue
-            if final_pending.is_set():
-                continue  # una traduzione definitiva ha la precedenza
+            if final_pending.is_set() or src_q.qsize() > 0:
+                continue  # con frasi in attesa l'anteprima ruberebbe il turno
             last_txt, last_at = cur, time.time()
             sl, dl, _ = route(cur)
             if not tr_lock.acquire(blocking=False):
@@ -648,7 +648,7 @@ def emit_final(text: str, my_gen: int, seg_id: int) -> None:
         broadcast({"type": "drop", "id": f"{RUN_ID}.{my_gen}.{seg_id}"})
         return
     _last_final["text"] = t
-    src_q.put((t, my_gen, f"{RUN_ID}.{my_gen}.{seg_id}"))
+    src_q.put((t, my_gen, f"{RUN_ID}.{my_gen}.{seg_id}", time.time()))
 
 
 def reader_thread(proc, my_gen: int) -> None:
@@ -665,7 +665,7 @@ def reader_thread(proc, my_gen: int) -> None:
                 buf = []
                 if chunk and not NOISE_RE.match(chunk) \
                         and chunk.lower().strip(" .!?,") not in HALLUC:
-                    src_q.put((chunk, my_gen, ""))
+                    src_q.put((chunk, my_gen, "", time.time()))
             continue
         m = TS_RE.match(line)
         if m and m.group(1).strip():
@@ -681,17 +681,29 @@ def translator_thread() -> None:
     seq = int(time.time() * 10) % 100000
     while not stop_flag.is_set():
         try:
-            text, g, ext_id = src_q.get(timeout=0.3)
+            text, g, ext_id, queued_at = src_q.get(timeout=0.3)
         except queue.Empty:
             continue
         if g != gen or text == last:
             continue
+        # se si accumula troppo, il ritardo diventa inutilizzabile: si tiene
+        # il testo trascritto e si salta la traduzione delle piu' vecchie
+        if src_q.qsize() > 4:
+            broadcast({"type": "line", "id": ext_id or seq, "src": text,
+                       "dst": "", "backend": "saltata", "ms": 0,
+                       "t": time.strftime("%H:%M:%S"), "srcLang": CFG["src"],
+                       "dstLang": CFG["dst"], "how": "coda", "part": ""},
+                      save=True)
+            continue
         last = text
         seq += 1
         sid = ext_id or seq
-        if not ext_id:
-            broadcast({"type": "partial", "id": sid, "src": text,
-                       "t": time.strftime("%H:%M:%S")})
+        # la riga si fissa subito con il testo originale: la traduzione la
+        # riempie quando arriva. Prima nasceva solo a traduzione conclusa e,
+        # con la coda accumulata, la frase spariva dalla vista prima di
+        # comparire nella lista.
+        broadcast({"type": "partial", "id": sid, "src": text,
+                   "t": time.strftime("%H:%M:%S")})
         broadcast({"type": "status", "state": "busy", "text": "traduco"})
 
         # due voci accavallate finiscono in un chunk solo: se dentro ci sono
@@ -726,6 +738,7 @@ def translator_thread() -> None:
                 continue
             broadcast({"type": "line", "id": bid, "src": btext, "dst": out, "backend": backend,
                        "ms": int((time.time() - t0) * 1000), "t": time.strftime("%H:%M:%S"),
+                       "queue": src_q.qsize(), "lag": round(time.time() - queued_at, 1),
                        "srcLang": src_l, "dstLang": dst_l, "how": how,
                        "part": f"{bi + 1}/{len(blocks)}" if len(blocks) > 1 else ""},
                       save=True)
@@ -900,7 +913,10 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  .row{border-left:2px solid #1c1e28;padding-left:13px;animation:in .22s ease}
  .row.top{border-left-color:#4c8dff}
  .row.top .it{color:#fff}
- .row.wait .it{color:#4e5464}
+ /* in attesa si legge l'originale, in grigio: il testo c'e' sempre */
+ .row.wait .it{color:#7b8394;font-weight:500}
+ .row.skip .it{color:#8a92a6}
+ .row.skip .meta{color:#7a5a35}
  .row.old{opacity:.72}
  @keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
  .sep{font-size:10.5px;color:#3a3f4d;text-transform:uppercase;letter-spacing:.09em;
@@ -1013,15 +1029,20 @@ function rowEl(e,old){
   return r;
 }
 function partial(e){const r=rowEl(e);
-  r.querySelector('.it').textContent='…';
-  r.querySelector('.pt').textContent=e.src;
-  r.querySelector('.meta').textContent=e.t;}
+  r.querySelector('.it').textContent=e.src;   // l'originale finche' non traduce
+  r.querySelector('.pt').textContent='';
+  r.querySelector('.meta').textContent=e.t+' · traduco…';
+  liveToEnd();scrollDown();}
 function line(e,old){const r=rowEl(e,old);r.classList.remove('wait');
-  r.querySelector('.it').textContent=e.dst;
-  r.querySelector('.pt').textContent=e.src;
-  r.querySelector('.meta').textContent=e.t+' · '+e.srcLang+'→'+e.dstLang
-    +(e.how&&e.how!=='fisso'?' ('+e.how+')':'')+(e.part?' · pezzo '+e.part:'')
-    +' · '+e.backend+' · '+e.ms+'ms';
+  const skipped=!e.dst;
+  r.classList.toggle('skip',skipped);
+  r.querySelector('.it').textContent=skipped?e.src:e.dst;
+  r.querySelector('.pt').textContent=skipped?'':e.src;
+  r.querySelector('.meta').textContent=skipped
+    ? e.t+' · non tradotta (traduttore in ritardo)'
+    : e.t+' · '+e.srcLang+'→'+e.dstLang
+      +(e.how&&e.how!=='fisso'?' ('+e.how+')':'')+(e.part?' · pezzo '+e.part:'')
+      +' · '+e.backend+' · '+e.ms+'ms';
   if(e.part)r.classList.add('part');
   r.dataset.dir=e.srcLang;r.dataset.dst=e.dst;r.dataset.dstlang=e.dstLang;
   if(e.srcLang===selD.value&&document.body.classList.contains('bidi'))r.classList.add('rev');
