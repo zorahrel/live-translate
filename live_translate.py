@@ -534,11 +534,14 @@ def stderr_thread(proc, my_gen: int) -> None:
                 det_lang.update(code=m.group(1), p=float(m.group(2)), at=time.time())
 
 
-STABLE_AFTER = 1.1    # pausa dopo cui la frase e' considerata chiusa
+STABLE_AFTER = 0.9    # pausa dopo cui la frase e' considerata chiusa
 MIN_WORDS = 3         # sotto questa soglia si aspetta: tradurre 'vezes do' non serve
 PREVIEW_EVERY = 1.2   # intervallo minimo fra due traduzioni provvisorie
-MAX_OPEN = 4.0        # oltre questo un segmento va chiuso comunque
-MAX_WORDS_OPEN = 14   # ...o quando e' diventato abbastanza lungo da bastare
+MAX_OPEN = 9.0        # oltre questo un segmento va chiuso comunque
+MAX_WORDS_OPEN = 26   # ...o quando e' diventato abbastanza lungo da bastare
+# tagliare a meta' frase produce righe come 'e eu vou fazer uma pesquisa' che
+# nessun traduttore puo' rendere bene, perche' manca cio' che veniva dopo
+SENT_END = re.compile(r"[.!?…]\s*$")
 
 
 def stream_reader(proc, my_gen: int) -> None:
@@ -571,9 +574,16 @@ def stream_reader(proc, my_gen: int) -> None:
                 nwords = len(re.findall(r"[\wà-ÿ']+", cur))
                 if nwords < MIN_WORDS:
                     continue
+                complete = bool(SENT_END.search(cur))
                 quiet = time.time() - lc >= STABLE_AFTER
                 too_long = time.time() - opened >= MAX_OPEN
                 too_big = nwords >= MAX_WORDS_OPEN
+                # una pausa breve chiude solo se la frase sembra finita:
+                # whisper mette il punto quando sente la cadenza conclusiva,
+                # e fidarsi di quello taglia molto meglio del cronometro
+                if quiet and not complete and nwords < 12 \
+                        and time.time() - lc < STABLE_AFTER * 2.5:
+                    continue
                 if not (quiet or too_long or too_big):
                     continue
                 state["sent"] = cur
@@ -838,8 +848,16 @@ def route(text: str):
     if not CFG["bidi"]:
         return CFG["src"], CFG["dst"], "fisso"
     a, b = CFG["langA"], CFG["langB"]
-    # 1. le stopword sono piu' affidabili di whisper sulle frasi corte, ma servono >=4 parole
+    # invertire la direzione e' una decisione forte: si fa solo se il testo e'
+    # davvero nell'altra lingua, non solo se le sue stopword vincono di poco.
+    # Un inglese in mezzo non deve diventare 'italiano quindi traduci in pt'.
     g = guess_lang(text, (a, b))
+    if g == b:
+        others = [c for c in ("en", "es", "fr") if c not in (a, b)]
+        if others:
+            wide = guess_lang(text, [b] + others, margin=1)
+            if wide and wide != b:
+                return a, b, f"terza lingua ({wide})"
     if g:
         return (a, b, "parole") if g == a else (b, a, "parole")
     # 2. altrimenti la lingua che whisper ha rilevato per questo chunk, se e' una delle due
