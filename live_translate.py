@@ -1391,7 +1391,13 @@ class Handler(BaseHTTPRequestHandler):
                     if say_proc and say_proc.poll() is None:
                         say_proc.terminate()
         if body.get("selfimprove") is not None:
+            was = CFG["selfimprove"]
             CFG["selfimprove"] = bool(body["selfimprove"])
+            # i comandi si danno nella lingua di destinazione: whisper deve
+            # poterla riconoscere, quindi passa in auto se era fissa su altro
+            if CFG["selfimprove"] and not was and CFG["src"] not in ("auto", CFG["dst"]):
+                CFG["src"] = "auto"
+                restart = True
         if body.get("rate") is not None:
             CFG["rate"] = max(120, min(320, int(body["rate"])))
         self._json({"ok": True, **CFG})
