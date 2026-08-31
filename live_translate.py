@@ -67,7 +67,49 @@ HALLUC = {
     "subtitles by the amara.org community", "thanks for watching",
     "thank you", "grazie", "sottotitoli e revisione a cura di qtss",
     "sottotitoli creati dalla comunità amara.org", "легенды", "字幕",
+    # allucinazioni ricorrenti di whisper sul silenzio e sul rumore
+    "i'm going to go", "i'm going to go to the next one", "to the next one",
+    "i don't know", "you", "so", "bye", "okay", "oh", "hmm", "yeah",
+    "please subscribe", "субтитры делал dimatorzok", "субтитры сделал dimatorzok",
+    "продолжение следует...", "редактор субтитров а.синецкая",
+    "ご視聴ありがとうございました", "1;1", "다음 영상에서 만나요",
 }
+
+# alfabeti che una lingua non puo' produrre: se compaiono, whisper sta
+# allucinando su rumore o silenzio, non trascrivendo qualcosa di reale
+SCRIPTS = {
+    "latin": r"[a-zà-ÿ]",
+    "cyrillic": r"[\u0400-\u04ff]",
+    "greek": r"[\u0370-\u03ff]",
+    "hangul": r"[\uac00-\ud7af]",
+    "cjk": r"[\u4e00-\u9fff\u3040-\u30ff]",
+    "arabic": r"[\u0600-\u06ff]",
+    "hebrew": r"[\u0590-\u05ff]",
+    "thai": r"[\u0e00-\u0e7f]",
+    "devanagari": r"[\u0900-\u097f]",
+}
+LANG_SCRIPT = {
+    "ru": "cyrillic", "uk": "cyrillic", "el": "greek", "ko": "hangul",
+    "zh": "cjk", "ja": "cjk", "ar": "arabic", "he": "hebrew", "th": "thai",
+    "hi": "devanagari",
+}
+
+
+def wrong_script(text: str) -> str:
+    """Ritorna il nome dell'alfabeto estraneo trovato, o '' se il testo e' plausibile.
+
+    Le lingue attive determinano cosa e' lecito: in una sessione pt/it una riga
+    in cirillico o hangul non e' una trascrizione, e' rumore interpretato.
+    """
+    active = {CFG["src"], CFG["dst"], CFG["langA"], CFG["langB"]} - {"auto", ""}
+    allowed = {LANG_SCRIPT.get(c, "latin") for c in active} or {"latin"}
+    for name, pattern in SCRIPTS.items():
+        if name in allowed:
+            continue
+        hits = len(re.findall(pattern, text))
+        if hits >= 2 or (hits and len(text) <= 12):
+            return name
+    return ""
 
 LANGS = [
     ("auto", "Rileva lingua"),
@@ -93,7 +135,7 @@ MODEL_FILE = {k: f for k, _, f in MODELS}
 
 CFG = {"src": "pt", "dst": "it", "model": "turbo", "capture": "1", "mic": 30,
        "bidi": False, "langA": "pt", "langB": "it", "stream": True,
-       "tts": False, "rate": 210, "preview": True}
+       "tts": False, "rate": 210, "preview": True, "selfimprove": False}
 
 # in sliding window whisper riscrive la riga con l'escape ANSI di clear-line
 ANSI_CLR = re.compile(r"\x1b\[2K")
@@ -661,10 +703,31 @@ def _dedup(text: str, prev: str) -> str:
     return " ".join(tw[best:]).strip()
 
 
+def _is_hallucination(t: str) -> str:
+    """Ritorna il motivo per cui il testo va scartato, o '' se e' buono."""
+    low = t.lower().strip(" .!?,-\"'")
+    if low in HALLUC:
+        return "frase tipica del silenzio"
+    bad = wrong_script(t)
+    if bad:
+        return f"alfabeto {bad} estraneo alle lingue attive"
+    words = re.findall(r"[\wà-ÿ']+", t.lower())
+    if len(words) >= 4:
+        # 'dodói dodói dodói' o 'no, no, no, no': whisper in loop su rumore
+        uniq = len(set(words))
+        if uniq <= 2 or uniq / len(words) < 0.34:
+            return "parole ripetute in loop"
+    return ""
+
+
 def emit_final(text: str, my_gen: int, seg_id: int) -> None:
     t = text.strip()
-    if not t or NOISE_RE.match(t) or t.lower().strip(" .!?,") in HALLUC:
+    if not t or NOISE_RE.match(t):
         broadcast({"type": "drop", "id": f"{RUN_ID}.{my_gen}.{seg_id}"})
+        return
+    why = _is_hallucination(t)
+    if why:
+        broadcast({"type": "drop", "id": f"{RUN_ID}.{my_gen}.{seg_id}", "why": why})
         return
     t = _dedup(t, _last_final["text"])
     if not t or len(re.findall(r"[\wà-ÿ']+", t)) < MIN_WORDS:
@@ -687,7 +750,7 @@ def reader_thread(proc, my_gen: int) -> None:
                 chunk = " ".join(buf).strip()
                 buf = []
                 if chunk and not NOISE_RE.match(chunk) \
-                        and chunk.lower().strip(" .!?,") not in HALLUC:
+                        and not _is_hallucination(chunk):
                     src_q.put((chunk, my_gen, "", time.time()))
             continue
         m = TS_RE.match(line)
@@ -728,6 +791,19 @@ def translator_thread() -> None:
         broadcast({"type": "partial", "id": sid, "src": text,
                    "t": time.strftime("%H:%M:%S")})
         broadcast({"type": "status", "state": "busy", "text": "traduco"})
+
+        # la frase e' rivolta al software? allora non si traduce, si esegue
+        if CFG.get("selfimprove"):
+            req = wake_word(text)
+            if req:
+                broadcast({"type": "line", "id": sid, "src": text,
+                           "dst": "→ richiesta al software: " + req,
+                           "backend": "comando", "ms": 0,
+                           "t": time.strftime("%H:%M:%S"), "srcLang": CFG["src"],
+                           "dstLang": CFG["dst"], "how": "comando", "part": ""},
+                          save=True)
+                threading.Thread(target=apply_request, args=(req,), daemon=True).start()
+                continue
 
         # due voci accavallate finiscono in un chunk solo: se dentro ci sono
         # davvero due lingue, si traduce pezzo per pezzo
@@ -815,7 +891,7 @@ def start_whisper() -> None:
             # la fine della frase. Il testo compare mentre si parla.
             cmd = [WHISPER, "-m", model_path, "-l", lang, "--step", "700",
                    "--length", "5000", "--keep", "250",
-                   "-c", CFG["capture"], "-t", "8"]
+                   "-fth", "120", "-c", CFG["capture"], "-t", "8"]
         else:
             cmd = [WHISPER, "-m", model_path, "-l", lang, "--step", "0", "--length", "6000",
                    "-vth", "0.6", "-c", CFG["capture"], "-t", "8"]
@@ -861,6 +937,59 @@ def speak(text: str, lang: str, interrupt: bool = True) -> bool:
         except Exception:  # noqa: BLE001
             return False
     return True
+
+
+# --------------------------------------------------------- auto-miglioramento
+# Si parla direttamente al software: "ehi porto, il testo e' troppo piccolo".
+# La frase non viene tradotta, viene eseguita.
+WAKE = re.compile(
+    r"^\W*(?:ehi|hey|ok|ok[.,]?\s*)?\s*"
+    r"(?:live\s*translate|livetranslate|porto|jarvis|computer|app)\b[\s,:.!]*",
+    re.I)
+improve_lock = threading.Lock()
+improving = {"busy": False}
+
+
+def wake_word(text: str) -> str:
+    """Se la frase e' rivolta all'app, ritorna la richiesta senza il richiamo."""
+    m = WAKE.match(text)
+    if not m:
+        return ""
+    rest = text[m.end():].strip(" ,.:;!?")
+    return rest if len(rest) >= 8 else ""
+
+
+def apply_request(request: str) -> None:
+    """Fa modificare il software dall'agente, in un thread separato."""
+    script = os.path.join(HERE, "self_improve.py")
+    if not os.path.exists(script):
+        broadcast({"type": "improve", "state": "error",
+                   "text": "self_improve.py non trovato"})
+        return
+    with improve_lock:
+        if improving["busy"]:
+            broadcast({"type": "improve", "state": "error",
+                       "text": "sto gia' lavorando alla richiesta precedente"})
+            return
+        improving["busy"] = True
+    broadcast({"type": "improve", "state": "work", "text": request})
+    try:
+        r = subprocess.run([sys.executable, script, request], cwd=HERE,
+                           capture_output=True, text=True, timeout=900)
+        try:
+            res = json.loads((r.stdout or "").strip().splitlines()[-1])
+        except Exception:  # noqa: BLE001
+            res = {"ok": False, "message": (r.stderr or "errore sconosciuto")[-160:]}
+        broadcast({"type": "improve",
+                   "state": "done" if res.get("ok") else "error",
+                   "text": res.get("message", ""), "commit": res.get("commit", "")})
+        if res.get("ok"):
+            speak(f"Fatto. {res.get('message','')}", CFG["dst"])
+    except Exception as exc:  # noqa: BLE001
+        broadcast({"type": "improve", "state": "error", "text": str(exc)[:160]})
+    finally:
+        with improve_lock:
+            improving["busy"] = False
 
 
 def set_mic(vol: int) -> None:
@@ -931,6 +1060,17 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  #caret{width:6px;height:11px;background:#4c8dff;display:inline-block;
    animation:blink 1s steps(2) infinite;border-radius:1px;vertical-align:-1px}
  @keyframes blink{50%{opacity:0}}
+ /* stato dell'auto-modifica: compare solo mentre lavora o quando ha finito */
+ #imp{display:none;align-items:center;gap:9px;padding:8px 18px;font-size:12.5px;
+   background:#101726;border-bottom:1px solid #1b2740;color:#a8c0e8;flex:0 0 auto}
+ #imp.on{display:flex}
+ #imp.err{background:#1d1113;border-bottom-color:#3a1d22;color:#f0a8ae}
+ #imp.ok{background:#0e1b13;border-bottom-color:#1d3a26;color:#9ae0b0}
+ #impdot{width:8px;height:8px;border-radius:50%;background:#4c8dff;flex:0 0 auto;
+   animation:pulse 1.1s ease-in-out infinite}
+ #imp.ok #impdot,#imp.err #impdot{animation:none}
+ #imp.ok #impdot{background:#4ade80}#imp.err #impdot{background:#f87171}
+ @keyframes pulse{50%{opacity:.25}}
  main{flex:1;overflow-y:auto;padding:16px 20px 10px}
  #log{display:flex;flex-direction:column;gap:15px}
  .row{border-left:2px solid #1c1e28;padding-left:13px;animation:in .22s ease}
@@ -998,10 +1138,14 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  <button id="tts" class="ico" title="leggi ad alta voce ogni traduzione">
   <svg viewBox="0 0 16 16"><path d="M8 2.5 4.5 5.5H2v5h2.5L8 13.5zM11 6a3 3 0 0 1 0 4M13 4a6 6 0 0 1 0 8"/></svg>
  </button>
+ <button id="self" class="ico" title="parlagli per farlo cambiare: &quot;Live Translate, il testo e' troppo piccolo&quot;">
+  <svg viewBox="0 0 16 16"><path d="M8 1.5a2 2 0 0 1 2 2v4a2 2 0 0 1-4 0v-4a2 2 0 0 1 2-2zM4 7.5a4 4 0 0 0 8 0M8 11.5v3"/></svg>
+ </button>
  <button id="pin" class="ico" title="tieni la finestra sopra tutte le altre">
   <svg viewBox="0 0 16 16"><path d="M6 1.5h4l-.6 4 2.6 2.2v1.1H4v-1.1L6.6 5.5zM8 8.8V14.5"/></svg>
  </button>
 </header>
+<div id="imp"><span id="impdot"></span><span id="imptxt"></span></div>
 <main id="m"><div id="log"></div>
  <div id="livewrap" class="row live"><div class="it" id="liveit"></div>
   <div class="pt" id="live"></div><div class="meta"><span id="caret"></span></div></div>
@@ -1079,6 +1223,14 @@ $('swap').onclick=()=>{if(selD.value!=='auto')post({src:selD.value,dst:selS.valu
 $('bidi').onclick=()=>post({bidi:!document.body.classList.contains('bidi')});
 $('strm').onclick=()=>post({stream:!$('strm').classList.contains('on')});
 $('tts').onclick=()=>post({tts:!$('tts').classList.contains('on')});
+$('self').onclick=()=>post({selfimprove:!$('self').classList.contains('on')});
+function improve(e){
+  const b=$('imp');b.className='on'+(e.state==='done'?' ok':e.state==='error'?' err':'');
+  $('imptxt').textContent=
+    e.state==='work' ? 'sto modificando il software: '+e.text
+    : e.state==='done' ? 'fatto: '+e.text+(e.commit?'  ('+e.commit+')':'')
+    : 'non riuscito: '+e.text;
+  if(e.state!=='work')setTimeout(()=>{b.classList.remove('on');},12000);}
 $('pin').onclick=()=>{const on=!$('pin').classList.contains('on');
   $('pin').classList.toggle('on',on);
   if(window.webkit?.messageHandlers?.host)
@@ -1140,6 +1292,7 @@ fetch('/langs').then(r=>r.json()).then(j=>{
   $('bidi').classList.toggle('on',!!j.bidi);
   $('strm').classList.toggle('on',!!j.stream);
   $('tts').classList.toggle('on',!!j.tts);
+  $('self').classList.toggle('on',!!j.selfimprove);
   if(!window.webkit?.messageHandlers?.host)$('pin').style.display='none';});
 
 fetch('/history').then(r=>r.json()).then(j=>{
@@ -1155,6 +1308,7 @@ es.onmessage=ev=>{const e=JSON.parse(ev.data);
   if(e.type==='line'){line(e);liveClear(e.id);}
   else if(e.type==='live')liveShow(e);
   else if(e.type==='livedst')liveTrans(e);
+  else if(e.type==='improve')improve(e);
   else if(e.type==='drop')liveClear(e.id);
   else if(e.type==='partial')partial(e);
   else if(e.type==='cfg'){fill(selS,LS,e.src);fill(selD,LD,e.dst);
@@ -1164,6 +1318,7 @@ es.onmessage=ev=>{const e=JSON.parse(ev.data);
     $('bidi').classList.toggle('on',!!e.bidi);
     $('strm').classList.toggle('on',!!e.stream);
     $('tts').classList.toggle('on',!!e.tts);
+    $('self').classList.toggle('on',!!e.selfimprove);
     if(!e.stream)liveClear();
     selS.disabled=false;$('swap').style.opacity=e.bidi?.35:1;}
   else if(e.type==='status'){d.className='dot '+(e.state==='live'?'':e.state);st.textContent=e.text;}
@@ -1234,6 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
                 with say_lock:
                     if say_proc and say_proc.poll() is None:
                         say_proc.terminate()
+        if body.get("selfimprove") is not None:
+            CFG["selfimprove"] = bool(body["selfimprove"])
         if body.get("rate") is not None:
             CFG["rate"] = max(120, min(320, int(body["rate"])))
         self._json({"ok": True, **CFG})
@@ -1260,6 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
                         "model": CFG["model"], "mic": get_mic(),
                         "bidi": CFG["bidi"], "stream": CFG["stream"],
                         "tts": CFG["tts"], "rate": CFG["rate"],
+                        "selfimprove": CFG["selfimprove"],
                         "voices": sorted(VOICES)})
             return
         if self.path == "/history":
@@ -1330,6 +1488,8 @@ def main() -> int:
     ap.add_argument("--mic", type=int, default=None, help="volume microfono 0-100")
     ap.add_argument("--bidi", action="store_true",
                     help="bidirezionale: rileva la lingua e traduce nel verso giusto")
+    ap.add_argument("--self-improve", action="store_true",
+                    help="ascolta le richieste rivolte al software e le applica")
     ap.add_argument("--tts", action="store_true",
                     help="legge ad alta voce ogni traduzione")
     ap.add_argument("--no-stream", action="store_true",
@@ -1338,7 +1498,8 @@ def main() -> int:
     args = ap.parse_args()
     CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture,
                bidi=args.bidi, langA=args.src if args.src != "auto" else "pt", langB=args.dst,
-               stream=not args.no_stream, tts=args.tts)
+               stream=not args.no_stream, tts=args.tts,
+               selfimprove=args.self_improve)
 
     if not os.path.exists(WHISPER):
         print("manca whisper-stream: brew install whisper-cpp", file=sys.stderr)
