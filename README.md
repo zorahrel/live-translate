@@ -45,6 +45,14 @@ sicuro di una lingua che non e' nessuna delle due del dialogo, il chunk viene
 scartato invece di essere tradotto: prima passava intatto attraverso il
 traduttore e sporcava la cronologia.
 
+## Come si legge
+Un solo flusso che scorre, come una chat. In fondo c'e' la frase in corso,
+azzurra e con il cursore che lampeggia: cresce mentre si parla, con le parole
+nuove in evidenza e una traduzione provvisoria sopra. Quando la frase finisce
+diventa definitiva **sul posto** e la successiva le si mette sotto. Lo scroll
+resta agganciato in fondo e si sgancia da solo se si scorre indietro a
+rileggere.
+
 Si apre una finestra sopra le altre: traduzione grande, originale sotto.
 Dalla barra si cambiano a caldo **lingua sorgente, lingua di arrivo, modello e
 volume del microfono**; il VU meter accanto allo slider dice se il mic sta

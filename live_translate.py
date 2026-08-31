@@ -206,6 +206,9 @@ history: "list" = []
 proc_lock = threading.Lock()
 whisper_proc = None
 gen = 0
+# prefisso unico per processo: senza, gli id delle righe nuove collidono con
+# quelli gia' in cronologia e la vista sovrascrive le righe vecchie
+RUN_ID = format(int(time.time()) % 100000, "05d")
 
 def _session_file(resume_within: int = 1800) -> str:
     """Riusa l'ultimo file se e' stato scritto da poco, altrimenti ne apre uno.
@@ -251,7 +254,18 @@ def load_recent(limit: int = 400) -> list:
         except Exception:  # noqa: BLE001
             out = []
     if len(out) >= limit:
-        return out[-limit:]
+        out = out[-limit:]
+    seen: dict = {}
+    for i, row in enumerate(out):
+        rid = str(row.get("id", i))
+        if rid in seen:
+            seen[rid] += 1
+            row = dict(row)
+            row["id"] = f"{rid}~{seen[rid]}"
+            out[i] = row
+        else:
+            seen[rid] = 0
+    return out
     others = sorted(f for f in os.listdir(HIST_DIR)
                     if f.endswith(".jsonl") and os.path.join(HIST_DIR, f) != SESSION_FILE)
     for name in reversed(others):
@@ -263,7 +277,18 @@ def load_recent(limit: int = 400) -> list:
         out = rows + out
         if len(out) >= limit:
             break
-    return out[-limit:]
+    out = out[-limit:]
+    seen: dict = {}
+    for i, row in enumerate(out):
+        rid = str(row.get("id", i))
+        if rid in seen:
+            seen[rid] += 1
+            row = dict(row)
+            row["id"] = f"{rid}~{seen[rid]}"
+            out[i] = row
+        else:
+            seen[rid] = 0
+    return out
 
 
 def broadcast(evt: dict, save: bool = False) -> None:
@@ -527,7 +552,7 @@ def stream_reader(proc, my_gen: int) -> None:
             finally:
                 tr_lock.release()
             if backend != "none" and not final_pending.is_set():
-                broadcast({"type": "livedst", "id": f"{my_gen}.{seg}", "dst": out})
+                broadcast({"type": "livedst", "id": f"{RUN_ID}.{my_gen}.{seg}", "dst": out})
 
     threading.Thread(target=previewer, daemon=True).start()
 
@@ -554,7 +579,7 @@ def stream_reader(proc, my_gen: int) -> None:
                 if not state["opened"]:
                     state["opened"] = time.time()
                 seg = state["seg"]
-            broadcast({"type": "live", "id": f"{my_gen}.{seg}", "src": txt,
+            broadcast({"type": "live", "id": f"{RUN_ID}.{my_gen}.{seg}", "src": txt,
                        "t": time.strftime("%H:%M:%S")})
             continue
         buf += ch
@@ -571,7 +596,7 @@ def stream_reader(proc, my_gen: int) -> None:
                 if not state["opened"]:
                     state["opened"] = time.time()
                 seg = state["seg"]
-            broadcast({"type": "live", "id": f"{my_gen}.{seg}", "src": txt,
+            broadcast({"type": "live", "id": f"{RUN_ID}.{my_gen}.{seg}", "src": txt,
                        "t": time.strftime("%H:%M:%S")})
     if my_gen == gen and not stop_flag.is_set():
         broadcast({"type": "status", "state": "off", "text": "cattura interrotta"})
@@ -616,14 +641,14 @@ def _dedup(text: str, prev: str) -> str:
 def emit_final(text: str, my_gen: int, seg_id: int) -> None:
     t = text.strip()
     if not t or NOISE_RE.match(t) or t.lower().strip(" .!?,") in HALLUC:
-        broadcast({"type": "drop", "id": f"{my_gen}.{seg_id}"})
+        broadcast({"type": "drop", "id": f"{RUN_ID}.{my_gen}.{seg_id}"})
         return
     t = _dedup(t, _last_final["text"])
     if not t or len(re.findall(r"[\wà-ÿ']+", t)) < MIN_WORDS:
-        broadcast({"type": "drop", "id": f"{my_gen}.{seg_id}"})
+        broadcast({"type": "drop", "id": f"{RUN_ID}.{my_gen}.{seg_id}"})
         return
     _last_final["text"] = t
-    src_q.put((t, my_gen, f"{my_gen}.{seg_id}"))
+    src_q.put((t, my_gen, f"{RUN_ID}.{my_gen}.{seg_id}"))
 
 
 def reader_thread(proc, my_gen: int) -> None:
@@ -859,17 +884,16 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  .bars i.a{background:#4ade80}.bars i.b{background:#facc15}.bars i.c{background:#f87171}
  #vol{width:64px;accent-color:#4c8dff;cursor:pointer}
  #volv{font-size:11px;color:#5c6478;min-width:26px;text-align:right;font-variant-numeric:tabular-nums}
- #livewrap{flex:0 0 auto;padding:10px 20px 12px;border-bottom:1px solid #12131a;
-   background:linear-gradient(180deg,#0d0e16,#08080d);display:none}
+ /* la frase in corso e' l'ultima riga della lista, non una fascia separata:
+    un solo punto dove guardare, e la riga diventa definitiva sul posto */
+ #livewrap{display:none;border-left-color:#4c8dff;margin-top:15px}
  #livewrap.on{display:block}
- #liveit{font-size:23px;font-weight:600;color:#8fb4ff;letter-spacing:-.01em;
-   min-height:0;margin-bottom:3px;line-height:1.25}
+ #liveit{color:#8fb4ff}
  #liveit:empty{display:none}
- #liverow{display:flex;align-items:baseline;gap:5px}
- #live{font-size:15px;color:#79808f;line-height:1.35;font-style:italic}
+ #live{font-style:italic}
  #live b{color:#c3cad6;font-style:normal;font-weight:600}
- #caret{width:7px;height:14px;background:#4c8dff;display:inline-block;
-   animation:blink 1s steps(2) infinite;flex:0 0 auto;border-radius:1px}
+ #caret{width:6px;height:11px;background:#4c8dff;display:inline-block;
+   animation:blink 1s steps(2) infinite;border-radius:1px;vertical-align:-1px}
  @keyframes blink{50%{opacity:0}}
  main{flex:1;overflow-y:auto;padding:16px 20px 10px}
  #log{display:flex;flex-direction:column;gap:15px}
@@ -939,9 +963,10 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
   <svg viewBox="0 0 16 16"><path d="M6 1.5h4l-.6 4 2.6 2.2v1.1H4v-1.1L6.6 5.5zM8 8.8V14.5"/></svg>
  </button>
 </header>
-<div id="livewrap"><div id="liveit"></div>
- <div id="liverow"><div id="live"></div><span id="caret"></span></div></div>
-<main id="m"><div id="log"></div></main>
+<main id="m"><div id="log"></div>
+ <div id="livewrap" class="row live"><div class="it" id="liveit"></div>
+  <div class="pt" id="live"></div><div class="meta"><span id="caret"></span></div></div>
+</main>
 <footer><span id="bk">—</span><span class="sp"></span>
  <a id="save">salva .txt</a><a id="clr">pulisci vista</a>
  <span>whisper.cpp locale · cronologia su disco</span></footer>
@@ -951,7 +976,7 @@ const $=i=>document.getElementById(i);
 // per rileggere: in quel caso le righe nuove non devono strappargli la vista
 let stick=true;
 const log=$('log'),d=$('d'),st=$('st'),bk=$('bk'),selS=$('src'),selD=$('dst'),selM=$('mdl');
-let rows=new Map(),LS=[],LD=[];
+let rows=new Map(),LS=[],LD=[],collide=0;
 
 $('m').addEventListener('scroll',()=>{
   const el=$('m');stick=el.scrollHeight-el.scrollTop-el.clientHeight<40;});
@@ -965,6 +990,7 @@ function fill(sel,list,cur){sel.innerHTML='';list.forEach(([c,n])=>{
 
 function rowEl(e,old){
   let r=rows.get(e.id);
+  if(r&&!old&&r.dataset.hist==='1'){r=null;e.id=e.id+'#'+(++collide);}
   if(!r){
     r=document.createElement('div');r.className='row wait'+(old?' old':'');
     r.innerHTML='<div class="it"></div><div class="pt"></div>'+
@@ -975,10 +1001,10 @@ function rowEl(e,old){
       const d=rows.get(e.id); if(!d)return;
       fetch('/speak',{method:'POST',body:JSON.stringify(
         {text:d.dataset.dst||'',lang:d.dataset.dstlang||''})});};
+    if(old)r.dataset.hist='1';
     log.appendChild(r);rows.set(e.id,r);
     if(!old){[...log.children].forEach(c=>c.classList.remove('top'));r.classList.add('top');
-             r.classList.remove('old');
-             if(stick)requestAnimationFrame(()=>{$('m').scrollTop=$('m').scrollHeight;});}
+             r.classList.remove('old');liveToEnd();scrollDown();}
     while(log.children.length>200){
       const g=log.firstChild;
       for(const [k,v] of rows) if(v===g){rows.delete(k);break;}
@@ -1017,8 +1043,11 @@ window.__setPin=on=>$('pin').classList.toggle('on',!!on);
 
 // riga in diretta: il testo cresce mentre whisper rivede il segmento
 let liveId=null,liveTxt='';
+function scrollDown(){if(stick)requestAnimationFrame(()=>{
+  const m=$('m');m.scrollTop=m.scrollHeight;});}
 function liveShow(e){
-  $('livewrap').classList.add('on');
+  const w=$('livewrap');
+  if(!w.classList.contains('on')){w.classList.add('on');scrollDown();}
   liveId=e.id;
   // le parole nuove rispetto alla revisione precedente vanno in evidenza
   const old=liveTxt.split(/\s+/),now=e.src.split(/\s+/);
@@ -1026,9 +1055,12 @@ function liveShow(e){
   $('live').innerHTML=now.slice(0,i).join(' ')+(i<now.length?' <b>'+
     now.slice(i).join(' ').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</b>':'');
   liveTxt=e.src;
+  scrollDown();
 }
 function liveClear(id){if(liveId===id||!id){$('livewrap').classList.remove('on');
   $('live').textContent='';$('liveit').textContent='';liveTxt='';liveId=null;}}
+// la riga in corso resta sempre in fondo, sotto l'ultima frase conclusa
+function liveToEnd(){const m=$('m');m.appendChild($('livewrap'));}
 function liveTrans(e){if(liveId===e.id)$('liveit').textContent=e.dst;}
 $('big').onclick=e=>{document.body.classList.toggle('big');e.target.classList.toggle('on');};
 $('clr').onclick=()=>{log.innerHTML='';rows.clear();};
@@ -1072,7 +1104,7 @@ fetch('/history').then(r=>r.json()).then(j=>{
   const s=document.createElement('div');s.className='sep';
   s.textContent='— righe precedenti sopra · nuove qui sotto —';
   log.appendChild(s);
-  requestAnimationFrame(()=>{$('m').scrollTop=$('m').scrollHeight;});});
+  liveToEnd();requestAnimationFrame(()=>{$('m').scrollTop=$('m').scrollHeight;});});
 
 const es=new EventSource('/events');
 es.onmessage=ev=>{const e=JSON.parse(ev.data);
