@@ -1,9 +1,14 @@
+# modelli e dati locali
 models/
 history/
 .venv/
+.backends_dead.json
+.env
+
+# artefatti di build
 app/LiveTranslate
 LiveTranslate.app/
 apple_translate
-.backends_dead.json
+
 *.log
-test_*.txt
+.DS_Store

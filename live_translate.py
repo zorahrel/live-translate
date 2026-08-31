@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,18 +23,40 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
-WHISPER = "/opt/homebrew/bin/whisper-stream"
+def _find_whisper() -> str:
+    """whisper-stream, ovunque sia: Homebrew arm/intel, PATH, build locale."""
+    env = os.environ.get("LT_WHISPER")
+    if env and os.path.exists(env):
+        return env
+    found = shutil.which("whisper-stream")
+    if found:
+        return found
+    for c in ("/opt/homebrew/bin/whisper-stream", "/usr/local/bin/whisper-stream",
+              os.path.join(HERE, "whisper.cpp", "build", "bin", "whisper-stream")):
+        if os.path.exists(c):
+            return c
+    return "whisper-stream"
+
+
+WHISPER = _find_whisper()
 HIST_DIR = os.path.join(HERE, "history")
 os.makedirs(HIST_DIR, exist_ok=True)
 
-ENV_FILE = os.path.expanduser("~/.claude/jarvis/router/.env")
+# La chiave e' opzionale: senza, si usa il traduttore locale. Si legge
+# dall'ambiente o da un .env accanto allo script.
 API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
-if not API_KEY and os.path.exists(ENV_FILE):
-    with open(ENV_FILE) as fh:
-        for line in fh:
-            if line.startswith("CEREBRAS_API_KEY="):
-                API_KEY = line.split("=", 1)[1].strip()
-                break
+for _env in (os.path.join(HERE, ".env"), os.path.expanduser("~/.config/live-translate/.env")):
+    if API_KEY:
+        break
+    if os.path.exists(_env):
+        try:
+            with open(_env) as fh:
+                for line in fh:
+                    if line.startswith("CEREBRAS_API_KEY="):
+                        API_KEY = line.split("=", 1)[1].strip()
+                        break
+        except Exception:  # noqa: BLE001
+            pass
 
 TS_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*(.*)$")
 NOISE_RE = re.compile(r"^[\s\-\.\*\(\[\]\)_]*$")
