@@ -1,3 +1,9 @@
 models/
+history/
+.venv/
+app/LiveTranslate
+LiveTranslate.app/
+apple_translate
+.backends_dead.json
 *.log
 test_*.txt

@@ -69,7 +69,12 @@ MODELS = [
 MODEL_FILE = {k: f for k, _, f in MODELS}
 
 CFG = {"src": "pt", "dst": "it", "model": "turbo", "capture": "1", "mic": 30,
-       "bidi": False, "langA": "pt", "langB": "it"}
+       "bidi": False, "langA": "pt", "langB": "it", "stream": True,
+       "tts": False, "rate": 210, "preview": True}
+
+# in sliding window whisper riscrive la riga con l'escape ANSI di clear-line
+ANSI_CLR = re.compile(r"\x1b\[2K")
+ANSI_ANY = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 DET_RE = re.compile(r"auto-detected language: ([a-z]{2,3}) \(p = ([0-9.]+)\)")
 det_lock = threading.Lock()
@@ -280,22 +285,93 @@ def _t_apple(text: str) -> str:
     return r.stdout.strip()
 
 
+# MyMemory: 1.000 parole/giorno anonimo, 10.000 dichiarando un'email.
+# Una sessione di conversazione brucia il tier anonimo in una ventina di minuti.
+MM_EMAIL = os.environ.get("LT_EMAIL", "").strip()
+
+
 def _t_mymemory(text: str) -> str:
     src = ACTIVE["src"] if ACTIVE["src"] != "auto" else "autodetect"
     url = ("https://api.mymemory.translated.net/get?q=" + urllib.parse.quote(text[:480])
            + f"&langpair={src}|{ACTIVE['dst']}")
+    if MM_EMAIL:
+        url += "&de=" + urllib.parse.quote(MM_EMAIL)
     req = urllib.request.Request(url, headers={"User-Agent": "live-translate/1.0"})
     with urllib.request.urlopen(req, timeout=12) as r:
         data = json.loads(r.read())
     out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
-    if "MYMEMORY WARNING" in out.upper() or "QUERY LENGTH" in out.upper():
-        raise RuntimeError(out[:90])
+    up = out.upper()
+    if "MYMEMORY WARNING" in up or "QUERY LENGTH" in up or "ALL AVAILABLE FREE" in up:
+        raise RuntimeError("429 quota mymemory esaurita")
     return out
 
 
+# Argos gira in un venv separato (argostranslate non supporta il python 3.9 di
+# sistema) e resta caldo su una porta locale: caricare i modelli costa ~10s la
+# prima volta, ~0.7s per frase dopo. Senza rete e senza quote.
+ARGOS_PORT = int(os.environ.get("LT_ARGOS_PORT", "8778"))
+
+
+def _t_argos(text: str) -> str:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{ARGOS_PORT}/",
+        data=json.dumps({"text": text, "src": ACTIVE["src"], "dst": ACTIVE["dst"]}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return (json.loads(r.read()).get("text") or "").strip()
+
+
+def start_argos() -> None:
+    """Avvia il server locale se il venv c'e' e non e' gia' in ascolto."""
+    venv = os.path.join(HERE, ".venv", "bin", "python")
+    script = os.path.join(HERE, "argos_translate.py")
+    if not (os.path.exists(venv) and os.path.exists(script)):
+        return
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{ARGOS_PORT}/", timeout=1)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        subprocess.Popen([venv, script, str(ARGOS_PORT)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 ACTIVE = {"src": "pt", "dst": "it"}
-BACKENDS = [("cerebras", _t_llm), ("apple", _t_apple), ("mymemory", _t_mymemory)]
-_dead: set = set()
+# argos serve una frase alla volta: senza questo lock l'anteprima e la
+# traduzione definitiva si accodano e la seconda arriva con 5s di ritardo
+tr_lock = threading.Lock()
+final_pending = threading.Event()
+# ordine: locale prima. Le API remote sono utili solo se la coppia manca in
+# locale o se una chiave con credito da' una qualita' migliore.
+BACKENDS = [("argos", _t_argos), ("cerebras", _t_llm), ("apple", _t_apple),
+            ("mymemory", _t_mymemory)]
+DEAD_FILE = os.path.join(HERE, ".backends_dead.json")
+DEAD_TTL = 6 * 3600   # dopo sei ore si riprova: una ricarica va vista
+
+
+def _load_dead() -> set:
+    try:
+        with open(DEAD_FILE) as fh:
+            data = json.load(fh)
+        now = time.time()
+        return {k for k, ts in data.items() if now - ts < DEAD_TTL}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _save_dead() -> None:
+    try:
+        now = time.time()
+        with open(DEAD_FILE, "w") as fh:
+            json.dump({k: now for k in _dead}, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_dead: set = _load_dead()
 
 
 def translate(text: str, src_l: str = "", dst_l: str = ""):
@@ -314,8 +390,11 @@ def translate(text: str, src_l: str = "", dst_l: str = ""):
                 return out, name
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
-            if any(c in msg for c in ("402", "429", "403", "401")) or name == "apple":
+            if name == "argos":
+                pass  # 404 = coppia non installata: si prova il prossimo, senza bruciarlo
+            elif any(c in msg for c in ("402", "429", "403", "401")) or name == "apple":
                 _dead.add(name)
+                _save_dead()
             errs.append(f"{name}: {msg[:60]}")
     return f"[traduttore non disponibile — {'; '.join(errs)}]", "none"
 
@@ -332,6 +411,127 @@ def stderr_thread(proc, my_gen: int) -> None:
                 det_lang.update(code=m.group(1), p=float(m.group(2)), at=time.time())
 
 
+STABLE_AFTER = 1.4    # secondi senza revisioni prima di considerare chiusa una frase
+MIN_WORDS = 3         # sotto questa soglia si aspetta: tradurre 'vezes do' non serve
+PREVIEW_EVERY = 1.2   # intervallo minimo fra due traduzioni provvisorie
+
+
+def stream_reader(proc, my_gen: int) -> None:
+    """Modalita' sliding window: whisper riscrive la riga corrente man mano.
+
+    Il testo appare a schermo a ogni revisione (~700ms), ma la traduzione parte
+    solo quando la frase smette di cambiare: whisper riscrive costantemente
+    ('vezes do' -> 'as vezes do trabalho dele' -> ...) e tradurre ogni
+    revisione produce frammenti inutili e brucia quota.
+    """
+    state = {"cur": "", "seg": 0, "last_change": 0.0, "sent": ""}
+    lock = threading.Lock()
+
+    def flusher():
+        while not stop_flag.is_set() and my_gen == gen:
+            time.sleep(0.25)
+            with lock:
+                cur, lc, sent = state["cur"], state["last_change"], state["sent"]
+                if not cur or cur == sent or not lc:
+                    continue
+                if time.time() - lc < STABLE_AFTER:
+                    continue
+                if len(re.findall(r"[\wà-ÿ']+", cur)) < MIN_WORDS:
+                    continue
+                state["sent"] = cur
+                seg = state["seg"]
+                state["seg"] += 1
+                state["cur"] = ""
+                state["last_change"] = 0.0
+            emit_final(cur, my_gen, seg)
+
+    threading.Thread(target=flusher, daemon=True).start()
+
+    def previewer():
+        """Traduce una versione provvisoria mentre la frase e' ancora aperta.
+
+        Non sostituisce la traduzione finale: serve solo a non lasciare vuota
+        la riga in diretta. Si limita a una richiesta ogni PREVIEW_EVERY
+        secondi, altrimenti brucerebbe la quota del traduttore in un minuto.
+        """
+        last_txt, last_at = "", 0.0
+        while not stop_flag.is_set() and my_gen == gen:
+            time.sleep(0.3)
+            if not CFG.get("preview", True):
+                continue
+            with lock:
+                cur, seg = state["cur"], state["seg"]
+            if not cur or cur == last_txt:
+                continue
+            if time.time() - last_at < PREVIEW_EVERY:
+                continue
+            if len(re.findall(r"[\wà-ÿ']+", cur)) < MIN_WORDS:
+                continue
+            if final_pending.is_set():
+                continue  # una traduzione definitiva ha la precedenza
+            last_txt, last_at = cur, time.time()
+            sl, dl, _ = route(cur)
+            if not tr_lock.acquire(blocking=False):
+                continue
+            try:
+                out, backend = translate(cur, sl, dl)
+            finally:
+                tr_lock.release()
+            if backend != "none" and not final_pending.is_set():
+                broadcast({"type": "livedst", "id": f"{my_gen}.{seg}", "dst": out})
+
+    threading.Thread(target=previewer, daemon=True).start()
+
+    buf = ""
+    while not stop_flag.is_set() and my_gen == gen:
+        ch = proc.stdout.read(1)
+        if not ch:
+            break
+        if ch == "\r":
+            buf = ""
+            continue
+        if ch == "\n":
+            # whisper manda newline a ogni revisione della finestra, non a fine
+            # frase: non e' un segnale di chiusura. Chiude solo il timer.
+            txt = ANSI_ANY.sub("", buf).strip()
+            buf = ""
+            if not txt:
+                continue
+            with lock:
+                if txt == state["cur"]:
+                    continue
+                state["cur"] = txt
+                state["last_change"] = time.time()
+                seg = state["seg"]
+            broadcast({"type": "live", "id": f"{my_gen}.{seg}", "src": txt,
+                       "t": time.strftime("%H:%M:%S")})
+            continue
+        buf += ch
+        if ANSI_CLR.search(buf):
+            txt = ANSI_ANY.sub("", buf).strip()
+            buf = ""
+            if not txt:
+                continue
+            with lock:
+                if txt == state["cur"]:
+                    continue
+                state["cur"] = txt
+                state["last_change"] = time.time()
+                seg = state["seg"]
+            broadcast({"type": "live", "id": f"{my_gen}.{seg}", "src": txt,
+                       "t": time.strftime("%H:%M:%S")})
+    if my_gen == gen and not stop_flag.is_set():
+        broadcast({"type": "status", "state": "off", "text": "cattura interrotta"})
+
+
+def emit_final(text: str, my_gen: int, seg_id: int) -> None:
+    t = text.strip()
+    if not t or NOISE_RE.match(t) or t.lower().strip(" .!?,") in HALLUC:
+        broadcast({"type": "drop", "id": f"{my_gen}.{seg_id}"})
+        return
+    src_q.put((t, my_gen, f"{my_gen}.{seg_id}"))
+
+
 def reader_thread(proc, my_gen: int) -> None:
     buf = []
     for raw in proc.stdout:
@@ -346,7 +546,7 @@ def reader_thread(proc, my_gen: int) -> None:
                 buf = []
                 if chunk and not NOISE_RE.match(chunk) \
                         and chunk.lower().strip(" .!?,") not in HALLUC:
-                    src_q.put((chunk, my_gen))
+                    src_q.put((chunk, my_gen, ""))
             continue
         m = TS_RE.match(line)
         if m and m.group(1).strip():
@@ -362,15 +562,17 @@ def translator_thread() -> None:
     seq = int(time.time() * 10) % 100000
     while not stop_flag.is_set():
         try:
-            text, g = src_q.get(timeout=0.3)
+            text, g, ext_id = src_q.get(timeout=0.3)
         except queue.Empty:
             continue
         if g != gen or text == last:
             continue
         last = text
         seq += 1
-        sid = seq
-        broadcast({"type": "partial", "id": sid, "src": text, "t": time.strftime("%H:%M:%S")})
+        sid = ext_id or seq
+        if not ext_id:
+            broadcast({"type": "partial", "id": sid, "src": text,
+                       "t": time.strftime("%H:%M:%S")})
         broadcast({"type": "status", "state": "busy", "text": "traduco"})
 
         # due voci accavallate finiscono in un chunk solo: se dentro ci sono
@@ -393,12 +595,23 @@ def translator_thread() -> None:
             if how.startswith("scartato"):
                 continue
             t0 = time.time()
-            out, backend = translate(btext, src_l, dst_l)
+            final_pending.set()
+            try:
+                with tr_lock:
+                    out, backend = translate(btext, src_l, dst_l)
+            finally:
+                final_pending.clear()
+            if backend == "none":
+                broadcast({"type": "status", "state": "off", "text": "traduttore ko"})
+                broadcast({"type": "drop", "id": bid})
+                continue
             broadcast({"type": "line", "id": bid, "src": btext, "dst": out, "backend": backend,
                        "ms": int((time.time() - t0) * 1000), "t": time.strftime("%H:%M:%S"),
                        "srcLang": src_l, "dstLang": dst_l, "how": how,
                        "part": f"{bi + 1}/{len(blocks)}" if len(blocks) > 1 else ""},
                       save=True)
+            if CFG["tts"]:
+                speak(out, dst_l)
         broadcast({"type": "status", "state": "live", "text": "in ascolto"})
 
 
@@ -442,16 +655,57 @@ def start_whisper() -> None:
         # M2 Max: 8 core performance, whisper.cpp gira su Metal per l'encoder
         # in bidirezionale whisper deve poter riconoscere entrambe le lingue
         lang = "auto" if CFG["bidi"] else CFG["src"]
-        cmd = [WHISPER, "-m", model_path, "-l", lang, "--step", "0", "--length", "6000",
-               "-vth", "0.6", "-c", CFG["capture"], "-t", "8"]
-        if not CFG["bidi"]:
-            cmd.append("-kc")  # il contesto aiuta, ma su due lingue alternate confonde
+        if CFG["stream"]:
+            # sliding window: riscrive la riga ogni 700ms invece di aspettare
+            # la fine della frase. Il testo compare mentre si parla.
+            cmd = [WHISPER, "-m", model_path, "-l", lang, "--step", "700",
+                   "--length", "5000", "--keep", "250",
+                   "-c", CFG["capture"], "-t", "8"]
+        else:
+            cmd = [WHISPER, "-m", model_path, "-l", lang, "--step", "0", "--length", "6000",
+                   "-vth", "0.6", "-c", CFG["capture"], "-t", "8"]
+            if not CFG["bidi"]:
+                cmd.append("-kc")  # aiuta, ma su due lingue alternate confonde
         whisper_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, bufsize=1)
-        threading.Thread(target=reader_thread, args=(whisper_proc, my_gen), daemon=True).start()
+        target = stream_reader if CFG["stream"] else reader_thread
+        threading.Thread(target=target, args=(whisper_proc, my_gen), daemon=True).start()
         threading.Thread(target=stderr_thread, args=(whisper_proc, my_gen), daemon=True).start()
     broadcast({"type": "cfg", **CFG})
     broadcast({"type": "status", "state": "live", "text": "in ascolto"})
+
+
+# ---------------------------------------------------------------------- voce
+# `say` e' gia' nel sistema e ha voci native per tutte le lingue in elenco.
+VOICES = {"it": "Alice", "pt": "Luciana", "en": "Samantha", "es": "Monica",
+          "fr": "Amelie", "de": "Anna", "nl": "Xander", "ru": "Milena",
+          "pl": "Zosia", "tr": "Yelda", "sv": "Alva", "da": "Sara",
+          "ro": "Ioana", "el": "Melina", "cs": "Zuzana", "he": "Carmit",
+          "hu": "Mariska", "th": "Kanya", "ar": "Maged", "zh": "Tingting",
+          "ja": "Kyoko", "ko": "Yuna", "hi": "Lekha", "id": "Damayanti",
+          "fi": "Satu", "no": "Nora", "vi": "Linh", "uk": "Lesya", "ca": "Montse"}
+say_proc = None
+say_lock = threading.Lock()
+
+
+def speak(text: str, lang: str, interrupt: bool = True) -> bool:
+    """Legge il testo ad alta voce. Ritorna False se la lingua non ha una voce."""
+    global say_proc
+    voice = VOICES.get(lang)
+    if not voice or not text.strip():
+        return False
+    with say_lock:
+        # una frase nuova annulla quella in corso: in conversazione la voce
+        # deve stare dietro al parlato, non accodare minuti di ritardo
+        if interrupt and say_proc and say_proc.poll() is None:
+            say_proc.terminate()
+        try:
+            say_proc = subprocess.Popen(
+                ["say", "-v", voice, "-r", str(CFG.get("rate", 210)), text[:600]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001
+            return False
+    return True
 
 
 def set_mic(vol: int) -> None:
@@ -480,8 +734,13 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  body{margin:0;background:#07070b;color:#fff;overflow:hidden;
       font:16px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,sans-serif;
       display:flex;flex-direction:column}
- header{display:flex;align-items:center;gap:9px;padding:9px 14px;border-bottom:1px solid #16171f;
-        flex:0 0 auto;flex-wrap:wrap}
+ /* striscia superiore libera: sotto ci stanno i semafori di macOS, e qualunque
+    controllo messo li' si accavalla con la gestione finestre di sistema */
+ #drag{flex:0 0 auto;height:26px;-webkit-app-region:drag}
+ header{display:flex;align-items:center;gap:8px;padding:6px 14px 9px;
+        border-bottom:1px solid #16171f;flex:0 0 auto;flex-wrap:wrap;
+        -webkit-app-region:drag}
+ header select,header button,header .mic{-webkit-app-region:no-drag}
  .dot{width:9px;height:9px;border-radius:50%;background:#7de08d;box-shadow:0 0 10px #7de08d;
       transition:.2s;flex:0 0 auto}
  .dot.busy{background:#ffd166;box-shadow:0 0 10px #ffd166}
@@ -492,6 +751,11 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
         padding:5px 8px;font-size:12.5px;font-family:inherit;cursor:pointer;outline:none}
  select:hover,button:hover{border-color:#3a3d4d;color:#fff}
  button.on{color:#4c8dff;border-color:#2b3a5c;background:#0e1626}
+ /* icone disegnate, non emoji: le emoji cambiano faccia a ogni sistema */
+ button.ico{padding:5px 7px;line-height:0}
+ button.ico svg{width:15px;height:15px;fill:none;stroke:currentColor;
+   stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;display:block}
+ button.ico.on svg{stroke:#4c8dff}
  .arrow{color:#4c5265;font-size:13px}
  /* VU meter */
  .mic{display:flex;align-items:center;gap:7px;background:#0d0e14;border:1px solid #1c1e26;
@@ -501,6 +765,18 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  .bars i.a{background:#4ade80}.bars i.b{background:#facc15}.bars i.c{background:#f87171}
  #vol{width:64px;accent-color:#4c8dff;cursor:pointer}
  #volv{font-size:11px;color:#5c6478;min-width:26px;text-align:right;font-variant-numeric:tabular-nums}
+ #livewrap{flex:0 0 auto;padding:10px 20px 12px;border-bottom:1px solid #12131a;
+   background:linear-gradient(180deg,#0d0e16,#08080d);display:none}
+ #livewrap.on{display:block}
+ #liveit{font-size:23px;font-weight:600;color:#8fb4ff;letter-spacing:-.01em;
+   min-height:0;margin-bottom:3px;line-height:1.25}
+ #liveit:empty{display:none}
+ #liverow{display:flex;align-items:baseline;gap:5px}
+ #live{font-size:15px;color:#79808f;line-height:1.35;font-style:italic}
+ #live b{color:#c3cad6;font-style:normal;font-weight:600}
+ #caret{width:7px;height:14px;background:#4c8dff;display:inline-block;
+   animation:blink 1s steps(2) infinite;flex:0 0 auto;border-radius:1px}
+ @keyframes blink{50%{opacity:0}}
  main{flex:1;overflow-y:auto;padding:16px 20px 10px}
  #log{display:flex;flex-direction:column-reverse;gap:15px}
  .row{border-left:2px solid #1c1e28;padding-left:13px;animation:in .22s ease}
@@ -526,26 +802,51 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
  body.bidi .row.rev{border-left-color:#c084fc;margin-left:38px}
  body.bidi .row.rev.top{border-left-color:#e0a3ff}
  body.bidi .row.rev .it{color:#e9d5ff}
+ .row{position:relative}
+ .row .say{position:absolute;right:2px;top:2px;opacity:0;padding:3px 5px;
+   background:transparent;border-color:transparent;transition:opacity .15s;line-height:0}
+ .row .say svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;
+   stroke-linecap:round;stroke-linejoin:round;display:block}
+ .row:hover .say{opacity:.5}
+ .row .say:hover{opacity:1;color:#4c8dff}
  .row.part{border-left-style:dashed}
  .row.part .it{font-size:23px}
  body.bidi .row.rev.top .it{color:#faf5ff}
 </style></head><body>
+<div id="drag"></div>
 <header>
  <span class="dot" id="d"></span><span id="st">connessione…</span>
  <select id="src" title="lingua parlata"></select>
  <span class="arrow">&rarr;</span>
  <select id="dst" title="traduci in"></select>
+ <button id="swap" class="ico" title="inverti le lingue">
+  <svg viewBox="0 0 16 16"><path d="M2 5h9M8.5 2 11.5 5 8.5 8M14 11H5M7.5 8 4.5 11 7.5 14"/></svg>
+ </button>
  <select id="mdl" title="modello di trascrizione"></select>
  <div class="mic" title="livello e volume del microfono">
    <div class="bars" id="bars"></div>
    <input type="range" id="vol" min="0" max="100" step="1">
-   <span id="volv">—</span>
+   <span id="volv">&mdash;</span>
  </div>
- <button id="bidi" title="bidirezionale: rileva chi parla e traduce nel verso giusto">&#8644; auto</button>
  <span class="sp"></span>
- <button id="swap" title="inverti le lingue">&#8646;</button>
- <button id="big" title="testo grande, senza originale">Aa</button>
+ <button id="strm" class="ico" title="trascrive mentre parli, invece di attendere la fine frase">
+  <svg viewBox="0 0 16 16"><path d="M2 8h2l2-5 2.5 10L11 8h3"/></svg>
+ </button>
+ <button id="bidi" class="ico" title="bidirezionale: riconosce la lingua e traduce nel verso giusto">
+  <svg viewBox="0 0 16 16"><path d="M2 5.5h9M8.5 3 11 5.5 8.5 8M14 10.5H5M7.5 8 5 10.5 7.5 13"/></svg>
+ </button>
+ <button id="big" class="ico" title="testo grande, senza originale">
+  <svg viewBox="0 0 16 16"><path d="M1.5 13 5 3l3.5 10M2.8 10h4.4M10 13l2.2-6 2.3 6M10.8 11h2.9"/></svg>
+ </button>
+ <button id="tts" class="ico" title="leggi ad alta voce ogni traduzione">
+  <svg viewBox="0 0 16 16"><path d="M8 2.5 4.5 5.5H2v5h2.5L8 13.5zM11 6a3 3 0 0 1 0 4M13 4a6 6 0 0 1 0 8"/></svg>
+ </button>
+ <button id="pin" class="ico" title="tieni la finestra sopra tutte le altre">
+  <svg viewBox="0 0 16 16"><path d="M6 1.5h4l-.6 4 2.6 2.2v1.1H4v-1.1L6.6 5.5zM8 8.8V14.5"/></svg>
+ </button>
 </header>
+<div id="livewrap"><div id="liveit"></div>
+ <div id="liverow"><div id="live"></div><span id="caret"></span></div></div>
 <main id="m"><div id="log"></div></main>
 <footer><span id="bk">—</span><span class="sp"></span>
  <a id="save">salva .txt</a><a id="clr">pulisci vista</a>
@@ -566,7 +867,14 @@ function rowEl(e,old){
   let r=rows.get(e.id);
   if(!r){
     r=document.createElement('div');r.className='row wait'+(old?' old':'');
-    r.innerHTML='<div class="it"></div><div class="pt"></div><div class="meta"></div>';
+    r.innerHTML='<div class="it"></div><div class="pt"></div>'+
+      '<div class="meta"></div><button class="say" title="leggi questa riga">'+
+      '<svg viewBox="0 0 16 16"><path d="M8 2.5 4.5 5.5H2v5h2.5L8 13.5zM11 6a3 3 0 0 1 0 4"/>'+
+      '</svg></button>';
+    r.querySelector('.say').onclick=ev=>{ev.stopPropagation();
+      const d=rows.get(e.id); if(!d)return;
+      fetch('/speak',{method:'POST',body:JSON.stringify(
+        {text:d.dataset.dst||'',lang:d.dataset.dstlang||''})});};
     log.appendChild(r);rows.set(e.id,r);
     if(!old){[...log.children].forEach(c=>c.classList.remove('top'));r.classList.add('top');
              r.classList.remove('old');}
@@ -585,7 +893,7 @@ function line(e,old){const r=rowEl(e,old);r.classList.remove('wait');
     +(e.how&&e.how!=='fisso'?' ('+e.how+')':'')+(e.part?' · pezzo '+e.part:'')
     +' · '+e.backend+' · '+e.ms+'ms';
   if(e.part)r.classList.add('part');
-  r.dataset.dir=e.srcLang;
+  r.dataset.dir=e.srcLang;r.dataset.dst=e.dst;r.dataset.dstlang=e.dstLang;
   if(e.srcLang===selD.value&&document.body.classList.contains('bidi'))r.classList.add('rev');
   if(!old)bk.textContent=e.backend;}
 function post(b){return fetch('/cfg',{method:'POST',body:JSON.stringify(b)});}
@@ -595,6 +903,29 @@ selD.onchange=()=>post({dst:selD.value});
 selM.onchange=()=>post({model:selM.value});
 $('swap').onclick=()=>{if(selD.value!=='auto')post({src:selD.value,dst:selS.value==='auto'?'it':selS.value});};
 $('bidi').onclick=()=>post({bidi:!document.body.classList.contains('bidi')});
+$('strm').onclick=()=>post({stream:!$('strm').classList.contains('on')});
+$('tts').onclick=()=>post({tts:!$('tts').classList.contains('on')});
+$('pin').onclick=()=>{const on=!$('pin').classList.contains('on');
+  $('pin').classList.toggle('on',on);
+  if(window.webkit?.messageHandlers?.host)
+    window.webkit.messageHandlers.host.postMessage({cmd:'pin',on:on});};
+window.__setPin=on=>$('pin').classList.toggle('on',!!on);
+
+// riga in diretta: il testo cresce mentre whisper rivede il segmento
+let liveId=null,liveTxt='';
+function liveShow(e){
+  $('livewrap').classList.add('on');
+  liveId=e.id;
+  // le parole nuove rispetto alla revisione precedente vanno in evidenza
+  const old=liveTxt.split(/\s+/),now=e.src.split(/\s+/);
+  let i=0;while(i<old.length&&i<now.length&&old[i]===now[i])i++;
+  $('live').innerHTML=now.slice(0,i).join(' ')+(i<now.length?' <b>'+
+    now.slice(i).join(' ').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</b>':'');
+  liveTxt=e.src;
+}
+function liveClear(id){if(liveId===id||!id){$('livewrap').classList.remove('on');
+  $('live').textContent='';$('liveit').textContent='';liveTxt='';liveId=null;}}
+function liveTrans(e){if(liveId===e.id)$('liveit').textContent=e.dst;}
 $('big').onclick=e=>{document.body.classList.toggle('big');e.target.classList.toggle('on');};
 $('clr').onclick=()=>{log.innerHTML='';rows.clear();};
 $('save').onclick=()=>{window.open('/export','_blank');};
@@ -626,7 +957,10 @@ fetch('/langs').then(r=>r.json()).then(j=>{
   fill(selM,j.models.map(m=>[m[0],m[1]]),j.model);
   $('vol').value=j.mic;$('volv').textContent=j.mic;
   document.body.classList.toggle('bidi',!!j.bidi);
-  $('bidi').classList.toggle('on',!!j.bidi);});
+  $('bidi').classList.toggle('on',!!j.bidi);
+  $('strm').classList.toggle('on',!!j.stream);
+  $('tts').classList.toggle('on',!!j.tts);
+  if(!window.webkit?.messageHandlers?.host)$('pin').style.display='none';});
 
 fetch('/history').then(r=>r.json()).then(j=>{
   if(!j.rows.length)return;
@@ -637,13 +971,19 @@ fetch('/history').then(r=>r.json()).then(j=>{
 
 const es=new EventSource('/events');
 es.onmessage=ev=>{const e=JSON.parse(ev.data);
-  if(e.type==='line')line(e);
+  if(e.type==='line'){line(e);liveClear(e.id);}
+  else if(e.type==='live')liveShow(e);
+  else if(e.type==='livedst')liveTrans(e);
+  else if(e.type==='drop')liveClear(e.id);
   else if(e.type==='partial')partial(e);
   else if(e.type==='cfg'){fill(selS,LS,e.src);fill(selD,LD,e.dst);
     if(selM.options.length)selM.value=e.model;
     $('vol').value=e.mic;$('volv').textContent=e.mic;
     document.body.classList.toggle('bidi',!!e.bidi);
     $('bidi').classList.toggle('on',!!e.bidi);
+    $('strm').classList.toggle('on',!!e.stream);
+    $('tts').classList.toggle('on',!!e.tts);
+    if(!e.stream)liveClear();
     selS.disabled=false;$('swap').style.opacity=e.bidi?.35:1;}
   else if(e.type==='status'){d.className='dot '+(e.state==='live'?'':e.state);st.textContent=e.text;}
 };
@@ -666,6 +1006,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path == "/speak":
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                b = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:  # noqa: BLE001
+                b = {}
+            ok = speak(b.get("text", ""), b.get("lang", CFG["dst"]))
+            self._json({"ok": ok})
+            return
         if self.path != "/cfg":
             self.send_error(404)
             return
@@ -690,11 +1039,22 @@ class Handler(BaseHTTPRequestHandler):
             CFG["dst"] = body["dst"]
             CFG["langB"] = body["dst"]
             _dead.discard("apple")  # la coppia e' cambiata: ridai una chance all'on-device
+        if body.get("stream") is not None and bool(body["stream"]) != CFG["stream"]:
+            CFG["stream"] = bool(body["stream"])
+            restart = True
         if body.get("model") and body["model"] != CFG["model"]:
             CFG["model"] = body["model"]
             restart = True
         if body.get("mic") is not None:
             set_mic(body["mic"])
+        if body.get("tts") is not None:
+            CFG["tts"] = bool(body["tts"])
+            if not CFG["tts"]:
+                with say_lock:
+                    if say_proc and say_proc.poll() is None:
+                        say_proc.terminate()
+        if body.get("rate") is not None:
+            CFG["rate"] = max(120, min(320, int(body["rate"])))
         self._json({"ok": True, **CFG})
         if restart:
             broadcast({"type": "status", "state": "busy", "text": "riavvio…"})
@@ -717,7 +1077,9 @@ class Handler(BaseHTTPRequestHandler):
                                    if os.path.exists(os.path.join(HERE, "models", f))],
                         "src": CFG["src"], "dst": CFG["dst"],
                         "model": CFG["model"], "mic": get_mic(),
-                        "bidi": CFG["bidi"]})
+                        "bidi": CFG["bidi"], "stream": CFG["stream"],
+                        "tts": CFG["tts"], "rate": CFG["rate"],
+                        "voices": sorted(VOICES)})
             return
         if self.path == "/history":
             self._json({"rows": load_recent(80)})
@@ -787,10 +1149,15 @@ def main() -> int:
     ap.add_argument("--mic", type=int, default=None, help="volume microfono 0-100")
     ap.add_argument("--bidi", action="store_true",
                     help="bidirezionale: rileva la lingua e traduce nel verso giusto")
+    ap.add_argument("--tts", action="store_true",
+                    help="legge ad alta voce ogni traduzione")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="attende la fine frase invece di trascrivere mentre si parla")
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture,
-               bidi=args.bidi, langA=args.src if args.src != "auto" else "pt", langB=args.dst)
+               bidi=args.bidi, langA=args.src if args.src != "auto" else "pt", langB=args.dst,
+               stream=not args.no_stream, tts=args.tts)
 
     if not os.path.exists(WHISPER):
         print("manca whisper-stream: brew install whisper-cpp", file=sys.stderr)
@@ -803,6 +1170,7 @@ def main() -> int:
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    start_argos()
     threading.Thread(target=translator_thread, daemon=True).start()
     start_whisper()
 
