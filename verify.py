@@ -116,33 +116,25 @@ pct_en = 100 * len(inv) / max(1, len(en_veri))
 check("l'inglese in mezzo non ribalta la direzione", pct_en <= 2.0,
       f"{len(inv)}/{len(en_veri)} = {pct_en:.2f}%")
 
-# Il giudice deve essere esterno: selezionare le frasi italiane con le stesse
-# parole che il riconoscitore usa per riconoscerle da' un 1,41% che non vuol
-# dire niente (la sovrapposizione era del 100%). langdetect e' addestrato
-# altrove e non sa niente delle liste qui dentro: giudica lui.
-try:
-    from langdetect import DetectorFactory, detect_langs
-    DetectorFactory.seed = 0
-    gold = {"it": [], "pt": []}
-    for r in rows:
-        t = r["src"]
-        if len(t.split()) < 4:
-            continue
-        try:
-            b = detect_langs(t)[0]
-        except Exception:  # noqa: BLE001
-            continue
-        if b.prob >= 0.99 and b.lang in gold:
-            gold[b.lang].append(t)
-    for lang, soglia in (("it", 14.0), ("pt", 2.0)):
-        corpus = gold[lang]
+# Il giudice deve essere esterno, e uno solo non basta: langdetect etichetta
+# 'italiano' col 99% di confidenza anche del portoghese (4% delle volte), e
+# misurare contro quelle frasi da' un numero peggiore del vero (10,39% invece
+# di 5,91%). goldset.json tiene solo le frasi su cui langdetect e il correttore
+# ortografico di macOS concordano. Si ricostruisce con build_goldset.py.
+GOLD = os.path.join(HERE, "goldset.json")
+if os.path.exists(GOLD):
+    gold = json.load(open(GOLD))
+    # soglie strette apposta: sono il valore misurato piu' un filo di margine,
+    # cosi' un peggioramento si vede subito invece di sparire in un tetto largo
+    for lang, soglia in (("it", 6.1), ("pt", 1.1)):
+        corpus = gold.get(lang, [])
         sb = [t for t in corpus if lt.route(t)[0] != lang]
         pct = 100 * len(sb) / max(1, len(corpus))
-        check(f"{lang} giudicato da langdetect sotto il {soglia}%", pct <= soglia,
+        check(f"{lang} sul campione a doppia conferma, sotto il {soglia}%", pct <= soglia,
               f"{len(sb)}/{len(corpus)} = {pct:.2f}%")
-except ImportError:
-    check("langdetect disponibile come giudice terzo", False,
-          "manca: .venv/bin/pip install langdetect")
+else:
+    check("il campione di riferimento esiste", False,
+          "manca goldset.json: .venv/bin/python build_goldset.py")
 
 lt.CFG.update(bidi=False)
 dev = sum(1 for r in rows if lt.route(r["src"])[0] != "pt")

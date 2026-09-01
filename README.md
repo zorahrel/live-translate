@@ -30,9 +30,15 @@ rilanciare, salta quello che c'è già. Lingue diverse dalla coppia predefinita:
 Per verificare che tutto regga dopo una modifica:
 
 ```bash
-./verify.py            # 25 controlli, esce non-zero se qualcosa si rompe
+./verify.py            # esce non-zero se qualcosa si rompe
 ./verify.py --ciclo    # aggiunge chiusura e riapertura (spegne l'app aperta)
 ```
+
+Il riconoscimento della lingua si misura su `goldset.json`, un campione di
+frasi vere prese dalla cronologia dove **due** giudici esterni concordano:
+langdetect e il correttore ortografico di macOS. Uno solo non basta, langdetect
+chiama 'italiano' del portoghese nel 4% dei casi. Si ricostruisce con
+`.venv/bin/python build_goldset.py` quando la cronologia cresce.
 
 ## Uso
 
