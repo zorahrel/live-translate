@@ -75,13 +75,34 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
             let hit = root.hitTest(NSPoint(x: rect.width / 2,
                                            y: rect.height - dragHeight / 2))
             let below = root.hitTest(NSPoint(x: rect.width / 2, y: 50))
+            var ok = root.subviews.contains(bar) && hit === bar && below !== bar
+                && bar.mouseDownCanMoveWindow
             print("striscia trovata nella gerarchia : \(root.subviews.contains(bar))")
             print("click in alto colpisce la striscia: \(hit === bar)")
             print("click sul testo la evita         : \(below !== bar)")
             print("puo' muovere la finestra         : \(bar.mouseDownCanMoveWindow)")
             print("finestra spostabile dallo sfondo : \(window.isMovableByWindowBackground)")
-            exit((root.subviews.contains(bar) && hit === bar && below !== bar
-                  && bar.mouseDownCanMoveWindow) ? 0 : 1)
+            // i semafori stanno nel themeFrame, sopra il contentView: la
+            // striscia si sovrappone a loro ma il click gli arriva comunque
+            // prima. Va verificato, non dato per scontato.
+            for (name, kind) in [("chiudi", NSWindow.ButtonType.closeButton),
+                                 ("minimizza", .miniaturizeButton),
+                                 ("ingrandisci", .zoomButton)] {
+                guard let b = window.standardWindowButton(kind) else { ok = false; continue }
+                let c = b.convert(NSPoint(x: b.bounds.midX, y: b.bounds.midY), to: nil)
+                let got = window.contentView?.superview?.hitTest(c) === b
+                print("semaforo '\(name)' resta cliccabile : \(got)")
+                if !got { ok = false }
+            }
+            // il badge deve dire la modalita': si provano i due versi
+            setBadge(bidi: false, src: "pt", dst: "it")
+            let uni = NSApp.dockTile.badgeLabel ?? "nil"
+            setBadge(bidi: true, src: "pt", dst: "it")
+            let bi = NSApp.dockTile.badgeLabel ?? "nil"
+            print("badge in un verso                : \(uni)")
+            print("badge in conversazione           : \(bi)")
+            if uni != "pt→it" || bi != "pt⇄it" { ok = false }
+            exit(ok ? 0 : 1)
         }
 
         // niente controlli nella titlebar: si accavallano con i semafori e con

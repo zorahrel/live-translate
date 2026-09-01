@@ -267,7 +267,57 @@ def decisive_lang(text: str, candidates) -> str:
         hits[c] = {w for w in hits[c]
                    if not any(w in DECISIVE.get(o, set()) for o in candidates if o != c)}
     winners = [c for c in candidates if hits[c]]
-    return winners[0] if len(winners) == 1 else ""
+    if len(winners) == 1:
+        return winners[0]
+    return shape_lang(text, candidates)
+
+
+# Tratti di forma, non di vocabolario: un elenco di parole si puo' allungare
+# all'infinito e non copre mai la frase nuova ('Ho fame da morire' non ha
+# nessuna parola marcatrice). Questi sono pezzi di grammatica che una lingua
+# produce di continuo e l'altra praticamente mai.
+SHAPE = {
+    "it": [
+        r"\bgli\b", r"\bdegli\b", r"\bnegli\b", r"\bdell[aeo']", r"\bnell[aeo']",
+        r"\bsull[aeo']", r"\ball[aeo']\b", r"\bdei\b", r"\bnei\b", r"\bcol\b",
+        r"\bd'[aeiou]", r"\bl'[aeiou]", r"\bun'[aeiou]",       # elisione
+        r"\b(ho|hai|ha|hanno|abbiamo|avete)\b",                 # avere
+        r"\b(sono|sei|siamo|siete|era|erano)\b",
+        r"\b(il|lo|gli|delle|questa|quello|quella)\b",
+        r"\w(zione|zioni|mente|issimo|issima|etto|etta)\b",
+        r"\bch[ei]\b", r"\bperch[ée]\b", r"\bpi[ùu]\b", r"\bpo'\b",
+    ],
+    "pt": [
+        r"\b(os|as)\s", r"\bd[oa]s\b", r"\bn[oa]s?\b", r"\bpel[ao]s?\b",
+        r"\b(é|está|estão|são|foi|tem|têm)\b",
+        r"\b(você|vocês|voce|eu|ele|ela|nós)\b",
+        r"\bn[ãa]o\b", r"\bt[oô]\b", r"\bcad[êe]\b", r"\bpra\b", r"\bmuito\b",
+        r"\w(ção|ções|inho|inha|ando|endo|indo)\b",
+        r"ão\b", r"õe", r"ç", r"nh", r"lh",
+    ],
+    "es": [r"\b(el|los|las|una?)\b", r"\bñ", r"\b(está|estoy|es|son)\b", r"ción\b"],
+    "en": [r"\b(the|a|an)\s", r"\b(is|are|was|were|have|has)\b", r"\b(i'm|it's|don't)\b",
+           r"\w(ing|tion|ed)\b"],
+}
+SHAPE_RE = {k: [re.compile(p, re.I) for p in v] for k, v in SHAPE.items()}
+
+
+def shape_lang(text: str, candidates, margin: int = 1) -> str:
+    """Lingua indovinata dalla grammatica: articoli, ausiliari, suffissi.
+
+    Serve dove il vocabolario non arriva: 'Ho fame da morire' non ha parole
+    marcatrici, ma 'ho' come ausiliare e' italiano e basta. Il margine e' 1
+    perche' una frase corta produce pochi segnali: chiederne due significa
+    non decidere mai proprio nei casi per cui questa funzione esiste.
+    """
+    scores = {c: sum(1 for r in SHAPE_RE.get(c, []) if r.search(text))
+              for c in candidates}
+    ranked = sorted(scores.values(), reverse=True)
+    if not ranked or ranked[0] == 0:
+        return ""
+    if len(ranked) > 1 and ranked[0] - ranked[1] < margin:
+        return ""
+    return max(scores, key=scores.get)
 
 
 def score_lang(text: str, candidates) -> dict:
