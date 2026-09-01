@@ -304,12 +304,27 @@ SHAPE = {
     "it": [
         r"\bgli\b", r"\bdegli\b", r"\bnegli\b", r"\bdell[aeo']", r"\bnell[aeo']",
         r"\bsull[aeo']", r"\ball[aeo']\b", r"\bdei\b", r"\bnei\b", r"\bcol\b",
-        r"\bd'[aeiou]", r"\bl'[aeiou]", r"\bun'[aeiou]",       # elisione
+        r"\bd'[aeiou]", r"\bl'[aeiou]", r"\bun'[aeiou]", r"\bc'[eè]", r"\bpo'\b",
         r"\b(ho|hai|ha|hanno|abbiamo|avete)\b",                 # avere
-        r"\b(sono|sei|siamo|siete|era|erano)\b",
-        r"\b(il|lo|gli|delle|questa|quello|quella)\b",
-        r"\w(zione|zioni|mente|issimo|issima|etto|etta)\b",
-        r"\bch[ei]\b", r"\bperch[ée]\b", r"\bpi[ùu]\b", r"\bpo'\b",
+        r"\b(sono|sei|siamo|siete|era|erano|è|ed è)\b",
+        r"\b(il|lo|gli|delle|questa|quello|quella|quest[oiae])\b",
+        r"\w(zione|zioni|mente|issimo|issima|etto|etta|aggio|ezza)\b",
+        r"\bch[ei]\b", r"\bperch[ée]\b", r"\bpi[ùu]\b",
+        # preposizioni e congiunzioni che il portoghese non usa cosi'
+        r"\b(di|da|in|con|su|per|tra|fra)\s+(un|una|uno|il|lo|la|le|i|gli|questo|questa)\b",
+        r"\b(ed|od)\s", r"\bnon\s+(si|ci|mi|ti|ho|hai|ha|e|è)\b",
+        r"\b(anche|ancora|invece|infatti|quindi|dunque|oppure|mentre|senza)\b",
+        r"\b(essere|avere|fare|dire|potere|volere|dovere|sapere)\b",
+        r"\w(are|ere|ire)\s+(a|il|la|le|un|una|in|di|con)\b",   # infinito + prep
+        r"\b(molto|troppo|abbastanza|proprio|davvero|magari|forse)\b",
+        # possessivi e pronomi: in portoghese sono meu/teu/seu, dele/dela.
+        # Fuori quelli che le due lingue condividono ('me', 'te', 'ora',
+        # 'como'): aggiungerli guadagnava sull'italiano e perdeva il doppio
+        # sul portoghese, che e' il verso piu' usato.
+        r"\b(mio|mia|miei|mie|tuo|tua|tuoi|tue|suoi|nostro|nostra|vostro)\b",
+        r"\b(noi|voi|lui|lei)\b",
+        r"\b(qui|qua|lì|là|dove|quando|perché|cosa)\b",
+        r"\b(dopo|adesso|oggi|ieri|domani|ancora)\b",
     ],
     "pt": [
         r"\b(os|as)\s", r"\bd[oa]s\b", r"\bn[oa]s?\b", r"\bpel[ao]s?\b",
