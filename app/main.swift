@@ -53,14 +53,36 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         web.navigationDelegate = self
         web.setValue(false, forKey: "drawsBackground")
         web.autoresizingMask = [.width, .height]
-        window.contentView = web
+
+        // WKWebView risponde ai click per conto suo e una sottovista non li
+        // vedrebbe mai: la striscia deve essere sua sorella dentro un
+        // contenitore, non sua figlia.
+        let root = NSView(frame: rect)
+        root.autoresizingMask = [.width, .height]
+        root.addSubview(web)
+        window.contentView = root
 
         // la striscia di trascinamento sta sopra il web: la pagina lascia
         // vuoti i primi 26px proprio per questo (vedi #drag nel CSS)
         let bar = DragBar(frame: NSRect(x: 0, y: rect.height - dragHeight,
                                         width: rect.width, height: dragHeight))
         bar.autoresizingMask = [.width, .minYMargin]
-        web.addSubview(bar)
+        root.addSubview(bar, positioned: .above, relativeTo: web)
+        // autodiagnosi: LT_SELFTEST=1 stampa lo stato della striscia e esce,
+        // perche' simulare un trascinamento vero richiede i permessi di
+        // accessibilita' che una shell non ha
+        if ProcessInfo.processInfo.environment["LT_SELFTEST"] == "1" {
+            let hit = root.hitTest(NSPoint(x: rect.width / 2,
+                                           y: rect.height - dragHeight / 2))
+            let below = root.hitTest(NSPoint(x: rect.width / 2, y: 50))
+            print("striscia trovata nella gerarchia : \(root.subviews.contains(bar))")
+            print("click in alto colpisce la striscia: \(hit === bar)")
+            print("click sul testo la evita         : \(below !== bar)")
+            print("puo' muovere la finestra         : \(bar.mouseDownCanMoveWindow)")
+            print("finestra spostabile dallo sfondo : \(window.isMovableByWindowBackground)")
+            exit((root.subviews.contains(bar) && hit === bar && below !== bar
+                  && bar.mouseDownCanMoveWindow) ? 0 : 1)
+        }
 
         // niente controlli nella titlebar: si accavallano con i semafori e con
         // i comandi di gestione finestre di macOS. Pin e opacita' stanno nella
@@ -136,9 +158,6 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
             label = bidi ? "\(src)⇄\(dst)" : "\(src)→\(dst)"
         }
         NSApp.dockTile.badgeLabel = label.isEmpty ? nil : label
-        // il titolo e' nascosto nella titlebar trasparente, ma si legge nel
-        // menu Finestra e passando sull'icona del Dock
-        window.title = label.isEmpty ? "Live Translate" : "Live Translate  \(label)"
         NSApp.dockTile.display()
     }
 
