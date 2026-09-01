@@ -27,6 +27,13 @@ macOS 13 o superiore, Apple Silicon consigliato. Il setup è idempotente: si pu�
 rilanciare, salta quello che c'è già. Lingue diverse dalla coppia predefinita:
 `LT_SETUP_SRC=es LT_SETUP_DST=en ./setup.sh`.
 
+Per verificare che tutto regga dopo una modifica:
+
+```bash
+./verify.py            # 25 controlli, esce non-zero se qualcosa si rompe
+./verify.py --ciclo    # aggiunge chiusura e riapertura (spegne l'app aperta)
+```
+
 ## Uso
 
 ```bash
