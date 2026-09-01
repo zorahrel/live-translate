@@ -126,7 +126,7 @@ if os.path.exists(GOLD):
     gold = json.load(open(GOLD))
     # soglie strette apposta: sono il valore misurato piu' un filo di margine,
     # cosi' un peggioramento si vede subito invece di sparire in un tetto largo
-    for lang, soglia in (("it", 6.1), ("pt", 1.1)):
+    for lang, soglia in (("it", 5.6), ("pt", 1.1)):
         corpus = gold.get(lang, [])
         sb = [t for t in corpus if lt.route(t)[0] != lang]
         pct = 100 * len(sb) / max(1, len(corpus))

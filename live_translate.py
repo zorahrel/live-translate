@@ -325,6 +325,13 @@ SHAPE = {
         r"\b(noi|voi|lui|lei)\b",
         r"\b(qui|qua|lì|là|dove|quando|perché|cosa)\b",
         r"\b(dopo|adesso|oggi|ieri|domani|ancora)\b",
+        # avverbi e riempitivi del parlato: in una conversazione vera sono
+        # piu' frequenti dei verbi. Solo quelli che il portoghese non ha:
+        # 'vedi', 'senti', 'volta', 'modo', 'fatto' esistono in entrambe e
+        # facevano scivolare il portoghese in italiano.
+        r"\bcio[èe]\b", r"\bvabb[èe]\b", r"\bpo'\s+(di|del|della)\b", r"\bpoi\b",
+        r"\bci\s+(sta|siamo|possiamo)\b",
+        r"\b(riesci|riesce|riusciamo|capisci|capisce)\b",
     ],
     "pt": [
         r"\b(os|as)\s", r"\bd[oa]s\b", r"\bn[oa]s?\b", r"\bpel[ao]s?\b",
