@@ -1,11 +1,23 @@
 import Cocoa
 import WebKit
 
+/// La WKWebView copre tutta la finestra e si prende ogni click, quindi
+/// `isMovableByWindowBackground` non basta: il CSS `-webkit-app-region: drag`
+/// che funziona in Electron qui viene ignorato, e la finestra restava
+/// inchiodata. Questa striscia sta sopra la barra dei titoli, dove la pagina
+/// non mette controlli, e trascina la finestra a mano.
+final class DragBar: NSView {
+    override func mouseDown(with e: NSEvent) { window?.performDrag(with: e) }
+    override var mouseDownCanMoveWindow: Bool { true }
+}
+
 // Finestra nativa che ospita l'overlay servito da live_translate.py.
 // Esiste per tre cose che un wrapper --app di Chrome non da':
 // icona propria nel Dock, "sempre in primo piano", e sfondo trasparente.
 
 let PORT = ProcessInfo.processInfo.environment["LT_PORT"] ?? "8777"
+/// altezza della striscia trascinabile: la stessa di #drag nel CSS della pagina
+let dragHeight: CGFloat = 26
 
 final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
                       WKScriptMessageHandler {
@@ -42,6 +54,13 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         web.setValue(false, forKey: "drawsBackground")
         web.autoresizingMask = [.width, .height]
         window.contentView = web
+
+        // la striscia di trascinamento sta sopra il web: la pagina lascia
+        // vuoti i primi 26px proprio per questo (vedi #drag nel CSS)
+        let bar = DragBar(frame: NSRect(x: 0, y: rect.height - dragHeight,
+                                        width: rect.width, height: dragHeight))
+        bar.autoresizingMask = [.width, .minYMargin]
+        web.addSubview(bar)
 
         // niente controlli nella titlebar: si accavallano con i semafori e con
         // i comandi di gestione finestre di macOS. Pin e opacita' stanno nella
@@ -94,10 +113,33 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
             if let v = body["v"] as? Double { window.alphaValue = CGFloat(v) }
         case "reload":
             load()
+        case "mode":
+            // la pagina dice in che modalita' e' e con che lingue: il Dock lo
+            // mostra, cosi' si sa cosa sta facendo senza aprire la finestra
+            setBadge(bidi: (body["bidi"] as? Bool) ?? false,
+                     src: (body["src"] as? String) ?? "",
+                     dst: (body["dst"] as? String) ?? "")
         case "quit":
             NSApp.terminate(nil)
         default: break
         }
+    }
+
+    /// Badge sull'icona del Dock: 'pt→it' in una direzione, 'pt⇄it' in
+    /// conversazione. Senza, l'icona e' identica nelle due modalita' e non si
+    /// capisce se il bidirezionale e' acceso.
+    func setBadge(bidi: Bool, src: String, dst: String) {
+        let label: String
+        if src.isEmpty || dst.isEmpty {
+            label = ""
+        } else {
+            label = bidi ? "\(src)⇄\(dst)" : "\(src)→\(dst)"
+        }
+        NSApp.dockTile.badgeLabel = label.isEmpty ? nil : label
+        // il titolo e' nascosto nella titlebar trasparente, ma si legge nel
+        // menu Finestra e passando sull'icona del Dock
+        window.title = label.isEmpty ? "Live Translate" : "Live Translate  \(label)"
+        NSApp.dockTile.display()
     }
 
     func applyPin() {

@@ -230,6 +230,46 @@ NGRAMS = {
 }
 
 
+# parole che da sole bastano a decidere la lingua: in una conversazione vera
+# meta' dei turni sono cosi' corti ('Grazie', 'Va bene', 'Tudo bem') e la
+# soglia delle 4 parole li mandava tutti sulla lingua di default
+DECISIVE = {
+    "pt": {"oi", "obrigado", "obrigada", "tudo", "bem", "voce", "você", "não", "nao",
+           "sim", "legal", "cara", "gente", "vamos", "agora", "muito", "pra", "então",
+           "entao", "tá", "ta", "beleza", "valeu", "claro", "opa", "nossa", "poxa",
+           "bom", "boa", "dia", "noite", "tchau", "falou", "isso", "aqui", "ele", "ela"},
+    "it": {"ciao", "grazie", "prego", "sì", "bene", "certo", "allora",
+           "però", "pero", "perché", "perche", "così", "cosi", "più", "piu", "anche",
+           "adesso", "senti", "guarda", "ecco", "magari", "davvero", "vabbè",
+           "vabbe", "buongiorno", "buonasera", "arrivederci", "scusa", "figurati",
+           "andiamo", "voglio", "sono", "siamo", "sei", "gli", "della", "delle",
+           "nella", "quello", "questa", "domani", "oggi", "ieri", "mare", "niente",
+           "ti", "mi", "ci", "piace", "perfetto", "citta", "città", "bello", "bella",
+           "molto", "tanto", "sempre", "mai", "come", "dove", "quando", "cosa"},
+    "es": {"hola", "gracias", "vale", "claro", "bueno", "oye", "pues", "ahora"},
+    "en": {"hi", "hello", "thanks", "yes", "okay", "sure", "right", "well"},
+}
+
+
+def decisive_lang(text: str, candidates) -> str:
+    """Lingua decisa da una parola sola, o '' se non ce n'e' una inequivocabile.
+
+    Vale solo per le parole che appartengono a una delle lingue in gioco e a
+    nessun'altra: 'no' e 'claro' esistono sia in portoghese sia in italiano o
+    spagnolo, e su quelle si resta indecisi invece di tirare a indovinare.
+    """
+    words = set(re.findall(r"[a-zà-ÿ']+", text.lower()))
+    if not words:
+        return ""
+    hits = {c: words & DECISIVE.get(c, set()) for c in candidates}
+    # una parola che compare in piu' candidate non decide niente
+    for c in candidates:
+        hits[c] = {w for w in hits[c]
+                   if not any(w in DECISIVE.get(o, set()) for o in candidates if o != c)}
+    winners = [c for c in candidates if hits[c]]
+    return winners[0] if len(winners) == 1 else ""
+
+
 def score_lang(text: str, candidates) -> dict:
     """Punteggio grezzo per lingua: stopword + marcatori esclusivi + n-grammi."""
     low = text.lower()
@@ -247,14 +287,18 @@ def guess_lang(text: str, candidates, min_words: int = 4, margin: int = 2) -> st
     """Rilevamento a stopword fra le sole lingue candidate. '' se e' indeciso."""
     words = re.findall(r"[a-zà-ÿ']+", text.lower())
     if len(words) < min_words:
-        return ""
+        # in conversazione i turni corti sono la norma ('Grazie', 'Tudo bem'):
+        # scartarli tutti significa mandarli sulla lingua sbagliata
+        return decisive_lang(text, candidates)
     scores = score_lang(text, candidates)
     if not scores:
         return ""
     best = max(scores, key=scores.get)
     ranked = sorted(scores.values(), reverse=True)
     if ranked[0] == 0 or (len(ranked) > 1 and ranked[0] - ranked[1] < margin):
-        return ""
+        # stopword e n-grammi non hanno deciso ('Andiamo al mare domani' fa
+        # 0 a 0): resta la parola inequivocabile, se ce n'e' una
+        return decisive_lang(text, candidates)
     return best
 
 
@@ -1055,6 +1099,9 @@ PAGE = r"""<!doctype html><html lang="it"><head><meta charset="utf-8">
    stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;display:block}
  button.ico.on svg{stroke:#4c8dff}
  .arrow{color:#4c5265;font-size:13px}
+ /* in conversazione la freccia va nei due sensi: e' il modo piu' diretto per
+    vedere in che modalita' sei senza leggere lo stato dei pulsanti */
+ body.bidi .arrow{color:#c084fc;font-size:15px}
  /* VU meter */
  .mic{display:flex;align-items:center;gap:7px;background:#0d0e14;border:1px solid #1c1e26;
       border-radius:7px;padding:4px 9px}
@@ -1214,6 +1261,17 @@ function line(e,old){const r=rowEl(e,old);r.classList.remove('wait');
   if(e.srcLang===selD.value&&document.body.classList.contains('bidi'))r.classList.add('rev');
   if(!old)bk.textContent=e.backend;}
 function post(b){return fetch('/cfg',{method:'POST',body:JSON.stringify(b)});}
+// il Dock mostra modalita' e lingue: senza, l'icona e' identica in un verso
+// e in conversazione e non si sa cosa sta facendo l'app
+function sendMode(){
+  const bidi=document.body.classList.contains('bidi');
+  const a=document.querySelector('.arrow');
+  if(a){a.innerHTML=bidi?'&hArr;':'&rarr;';
+        a.title=bidi?'conversazione: riconosce chi parla e traduce nel verso giusto'
+                    :'traduce in un verso solo';}
+  const h=window.webkit?.messageHandlers?.host; if(!h)return;
+  h.postMessage({cmd:'mode',bidi:bidi,src:selS.value,dst:selD.value});
+}
 
 selS.onchange=()=>post({src:selS.value});
 selD.onchange=()=>post({dst:selD.value});
@@ -1277,7 +1335,8 @@ fetch('/langs').then(r=>r.json()).then(j=>{
   $('bidi').classList.toggle('on',!!j.bidi);
   $('strm').classList.toggle('on',!!j.stream);
   $('tts').classList.toggle('on',!!j.tts);
-  if(!window.webkit?.messageHandlers?.host)$('pin').style.display='none';});
+  if(!window.webkit?.messageHandlers?.host)$('pin').style.display='none';
+  sendMode();});
 
 fetch('/history').then(r=>r.json()).then(j=>{
   if(!j.rows.length)return;
@@ -1301,6 +1360,7 @@ es.onmessage=ev=>{const e=JSON.parse(ev.data);
     $('bidi').classList.toggle('on',!!e.bidi);
     $('strm').classList.toggle('on',!!e.stream);
     $('tts').classList.toggle('on',!!e.tts);
+    sendMode();
     if(!e.stream)liveClear();
     selS.disabled=false;$('swap').style.opacity=e.bidi?.35:1;}
   else if(e.type==='status'){d.className='dot '+(e.state==='live'?'':e.state);st.textContent=e.text;}
@@ -1380,11 +1440,12 @@ class Handler(BaseHTTPRequestHandler):
         if body.get("rate") is not None:
             CFG["rate"] = max(120, min(320, int(body["rate"])))
         self._json({"ok": True, **CFG})
+        # il cfg va mandato sempre: con il riavvio in mezzo la pagina restava
+        # con i pulsanti aggiornati ma il Dock fermo alla modalita' precedente
+        broadcast({"type": "cfg", **CFG})
         if restart:
             broadcast({"type": "status", "state": "busy", "text": "riavvio…"})
             threading.Thread(target=start_whisper, daemon=True).start()
-        else:
-            broadcast({"type": "cfg", **CFG})
 
     def do_GET(self):
         if self.path == "/":
@@ -1492,13 +1553,22 @@ def watchdog(grace: int) -> None:
     e' la lista dei subscriber SSE: la pagina aperta ne tiene esattamente uno.
     """
     global last_client_gone
+    # all'avvio nessuno e' ancora connesso: la finestra ci mette qualche
+    # secondo a caricare la pagina, e senza questa attesa il watchdog
+    # spegnerebbe il motore prima che l'app faccia in tempo ad attaccarsi.
+    # L'attesa non e' infinita: se non arriva nessuno il server e' inutile.
+    started = time.time()
+    seen_anyone = False
     while not stop_flag.is_set():
         time.sleep(5)
         with sub_lock:
             alive = len(subscribers)
         if alive:
+            seen_anyone = True
             last_client_gone = None
             continue
+        if not seen_anyone and time.time() - started < max(grace, 60):
+            continue      # non e' ancora arrivato nessuno: si da' tempo
         if last_client_gone is None:
             last_client_gone = time.time()
         elif time.time() - last_client_gone > grace:
@@ -1545,9 +1615,12 @@ def main() -> int:
     start_whisper()
 
     # chiudere la finestra deve spegnere il motore: se il processo viene ucciso
-    # senza questo, whisper e argos restano orfani a macinare
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *_: shutdown())
+    # senza questo, whisper e argos restano orfani a macinare. SIGHUP pero' va
+    # lasciato com'e' quando arriva gia' ignorato: sotto nohup significa che il
+    # terminale che ci ha lanciati sta chiudendo, non che dobbiamo morire.
+    signal.signal(signal.SIGTERM, lambda *_: shutdown())
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, lambda *_: shutdown())
     atexit.register(shutdown)
     if args.idle_exit > 0:
         threading.Thread(target=watchdog, args=(args.idle_exit,), daemon=True).start()
