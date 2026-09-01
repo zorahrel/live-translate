@@ -369,6 +369,12 @@ def guess_lang(text: str, candidates, min_words: int = 4, margin: int = 2) -> st
         return ""
     best = max(scores, key=scores.get)
     ranked = sorted(scores.values(), reverse=True)
+    # il margine protegge dai punteggi vicini (3 contro 2 non decide niente),
+    # ma quando l'altra lingua sta a zero non c'e' nessuna ambiguita' da
+    # proteggere: 'questo è questo' faceva it=2 pt=0 e finiva scartato lo
+    # stesso, mandando in portoghese una frase italiana senza dubbi.
+    if len(ranked) > 1 and ranked[0] > 0 and ranked[1] == 0:
+        return best
     if ranked[0] == 0 or (len(ranked) > 1 and ranked[0] - ranked[1] < margin):
         # stopword e n-grammi non hanno deciso ('Andiamo al mare domani' fa
         # 0 a 0): resta la parola inequivocabile, se ce n'e' una
@@ -1034,9 +1040,17 @@ def route(text: str):
     if g == b:
         others = [c for c in ("en", "es", "fr") if c not in (a, b)]
         if others:
+            # il margine qui e' stretto perche' basta poco a sospettare una
+            # terza lingua, ma non deve bastare a smentire un riconoscimento
+            # gia' netto: italiano e spagnolo condividono mezzo vocabolario, e
+            # con margin=1 un solo punto di spagnolo scartava frasi italiane
+            # senza dubbi ("non c'e' un livello" faceva it=1 pt=0).
             wide = guess_lang(text, [b] + others, margin=1)
             if wide and wide != b:
-                return a, b, f"terza lingua ({wide})"
+                sc = score_lang(text, (a, b))
+                netto = sc.get(b, 0) > 0 and sc.get(b, 0) > sc.get(a, 0)
+                if not netto:
+                    return a, b, f"terza lingua ({wide})"
     if g:
         return (a, b, "parole") if g == a else (b, a, "parole")
     # 2. altrimenti la lingua che whisper ha rilevato per questo chunk, se e' una delle due
