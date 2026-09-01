@@ -46,6 +46,9 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         window.styleMask.insert(.fullSizeContentView)
         window.backgroundColor = NSColor(red: 0.027, green: 0.027, blue: 0.043, alpha: 1)
         window.isMovableByWindowBackground = true
+        // performDrag non fa niente se la finestra non e' spostabile: e' il
+        // default, ma da questo dipende tutto il trascinamento
+        window.isMovable = true
         window.minSize = NSSize(width: 460, height: 220)
         window.setFrameAutosaveName("LiveTranslateWindow")
 
@@ -82,6 +85,20 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
             print("click sul testo la evita         : \(below !== bar)")
             print("puo' muovere la finestra         : \(bar.mouseDownCanMoveWindow)")
             print("finestra spostabile dallo sfondo : \(window.isMovableByWindowBackground)")
+            print("finestra spostabile              : \(window.isMovable)")
+            if !window.isMovable { ok = false }
+            // spostarla davvero: performDrag muove la finestra alla stessa
+            // maniera, quindi se questo non attecchisce non attecchira'
+            // nemmeno il trascinamento con il mouse
+            let start = window.frame.origin
+            window.setFrameOrigin(NSPoint(x: start.x + 120, y: start.y + 60))
+            let moved = window.frame.origin
+            let spostata = abs(moved.x - start.x - 120) < 1 && abs(moved.y - start.y - 60) < 1
+            window.setFrameOrigin(start)
+            let tornata = abs(window.frame.origin.x - start.x) < 1
+            print("si sposta davvero                : \(spostata)")
+            print("e torna dove stava               : \(tornata)")
+            if !spostata || !tornata { ok = false }
             // i semafori stanno nel themeFrame, sopra il contentView: la
             // striscia si sovrappone a loro ma il click gli arriva comunque
             // prima. Va verificato, non dato per scontato.
