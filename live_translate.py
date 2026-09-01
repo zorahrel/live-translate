@@ -62,6 +62,50 @@ for _env in (os.path.join(HERE, ".env"), os.path.expanduser("~/.config/live-tran
 TS_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}\]\s*(.*)$")
 NOISE_RE = re.compile(r"^[\s\-\.\*\(\[\]\)_]*$")
 TAG_RE = re.compile(r"[\[\(\*][^\]\)\*]{0,40}[\]\)\*]")
+# firma di chi ha fatto i sottotitoli: whisper l'ha imparata dai film ed e' la
+# cosa che dice piu' spesso quando sente silenzio o musica. Il nome cambia ogni
+# volta ('Legenda por Sônia Ruberti', 'Sottotitoli e revisione a cura di ...'),
+# quindi un elenco di frasi esatte non basta: serve la forma.
+CREDITS_HEAD = re.compile(
+    r"(?i)^\s*("
+    r"legenda[s]?\b.{0,40}?\b(por|by|pela|pelo)\b"
+    r"|sottotitoli\b.{0,50}?\b(a cura di|di)\b"
+    r"|subtitle[s]?\b.{0,40}?\bby\b"
+    r"|subtitulos\b.{0,40}?\bpor\b"
+    r"|revis(ão|ione)\b.{0,40}?\b(por|de|di)\b"
+    r"|(legenda[s]?|sottotitoli|subtitle[s]?|subtitulos)\s*:"
+    r")\s*:?\s*")
+# maiuscola iniziale, sigla o dominio: e' cosi' che si scrive un nome proprio
+NAME_RE = re.compile(r"^([A-ZÀ-ÖØ-Þ][\w'’.-]*|[\w.-]+\.(org|com|net|pt|it|br))$")
+
+
+def is_credits(t: str) -> bool:
+    """Vero se il testo e' la firma di chi ha fatto i sottotitoli.
+
+    Non basta la formula d'apertura: 'Legenda por favor explica melhor' e una
+    frase vera che comincia uguale. Quello che distingue un credito e' che
+    dopo la formula c'e' un nome proprio e la frase finisce li'.
+    """
+    low = t.lower().strip(" .!?,-\"'")
+    if low in ("amara.org", "caption.pt"):
+        return True
+    m = CREDITS_HEAD.match(t)
+    if not m:
+        return False
+    rest = t[m.end():].strip(" .!?,-\"'")
+    if not rest:
+        return False
+    # articoli e collettivi che stanno dentro un credito ma non sono il nome
+    FILLER = {"the", "a", "o", "os", "as", "il", "la", "l'", "de", "da", "do",
+              "comunidade", "comunidad", "community", "comunita", "comunità",
+              "team", "equipe", "grupo", "e", "and", "&", "di", "por"}
+    words = rest.split()
+    if len(words) > 6:      # un credito e' corto: oltre e' una frase vera
+        return False
+    return any(NAME_RE.match(w.strip(",;:")) for w in words) and \
+        all(NAME_RE.match(w.strip(",;:")) or w.lower() in FILLER for w in words)
+
+
 HALLUC = {
     "obrigado", "obrigada", "muito obrigado", "tchau", "amara.org",
     "legendas pela comunidade amara.org", "legendas: caption.pt",
@@ -635,7 +679,14 @@ def stream_reader(proc, my_gen: int) -> None:
             finally:
                 tr_lock.release()
             if backend != "none" and not final_pending.is_set():
-                broadcast({"type": "livedst", "id": f"{RUN_ID}.{my_gen}.{seg}", "dst": out})
+                # la traduzione puo' metterci secondi (visto un argos a 3058ms):
+                # nel frattempo la frase in diretta e' gia' cambiata sotto, e
+                # mostrarla darebbe una traduzione che non c'entra col testo.
+                with lock:
+                    still = state["cur"] == cur and state["seg"] == seg
+                if still:
+                    broadcast({"type": "livedst",
+                               "id": f"{RUN_ID}.{my_gen}.{seg}", "dst": out})
 
     threading.Thread(target=previewer, daemon=True).start()
 
@@ -726,6 +777,8 @@ def _is_hallucination(t: str) -> str:
     low = t.lower().strip(" .!?,-\"'")
     if low in HALLUC:
         return "frase tipica del silenzio"
+    if is_credits(t):
+        return "credito sottotitoli"
     bad = wrong_script(t)
     if bad:
         return f"alfabeto {bad} estraneo alle lingue attive"
