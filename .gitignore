@@ -12,3 +12,4 @@ apple_translate
 
 *.log
 .DS_Store
+.prefs.json

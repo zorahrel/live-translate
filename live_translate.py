@@ -182,6 +182,30 @@ CFG = {"src": "pt", "dst": "it", "model": "turbo", "capture": "1", "mic": 30,
        "bidi": False, "langA": "pt", "langB": "it", "stream": True,
        "tts": False, "rate": 210, "preview": True}
 
+# Le scelte fatte nella barra devono sopravvivere alla chiusura: senza, ogni
+# riavvio tornava a un verso solo con la lingua di partenza sbagliata, e
+# whisper girava con '-l it' su audio brasiliano trascrivendo parole inventate
+# ('Brasilegna', 'irmata'). Si salva solo quello che si sceglie a mano.
+PREFS_FILE = os.path.join(HERE, ".prefs.json")
+PREFS_KEYS = ("src", "dst", "bidi", "langA", "langB", "model", "stream", "tts", "rate")
+
+
+def load_prefs() -> None:
+    try:
+        with open(PREFS_FILE) as fh:
+            saved = json.load(fh)
+        CFG.update({k: v for k, v in saved.items() if k in PREFS_KEYS})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def save_prefs() -> None:
+    try:
+        with open(PREFS_FILE, "w") as fh:
+            json.dump({k: CFG[k] for k in PREFS_KEYS if k in CFG}, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
 # in sliding window whisper riscrive la riga con l'escape ANSI di clear-line
 ANSI_CLR = re.compile(r"\x1b\[2K")
 ANSI_ANY = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -1490,6 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
         if body.get("rate") is not None:
             CFG["rate"] = max(120, min(320, int(body["rate"])))
         self._json({"ok": True, **CFG})
+        save_prefs()   # quello che scegli qui deve valere anche al prossimo avvio
         # il cfg va mandato sempre: con il riavvio in mezzo la pagina restava
         # con i pulsanti aggiornati ma il Dock fermo alla modalita' precedente
         broadcast({"type": "cfg", **CFG})
@@ -1648,6 +1673,18 @@ def main() -> int:
     CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture,
                bidi=args.bidi, langA=args.src if args.src != "auto" else "pt", langB=args.dst,
                stream=not args.no_stream, tts=args.tts)
+    # le preferenze salvate valgono per quello che non e' stato chiesto a mano:
+    # un flag esplicito sulla riga di comando vince sempre su quello che c'era
+    given = {a.lstrip("-").replace("-", "_") for a in sys.argv[1:] if a.startswith("--")}
+    before = dict(CFG)
+    load_prefs()
+    for name, flag in (("src", "src"), ("dst", "dst"), ("model", "model"),
+                       ("bidi", "bidi"), ("tts", "tts"), ("stream", "no_stream")):
+        if flag in given:
+            CFG[name] = before[name]
+    if "src" in given or "dst" in given:
+        CFG["langA"] = CFG["src"] if CFG["src"] != "auto" else CFG["langA"]
+        CFG["langB"] = CFG["dst"]
 
     if not os.path.exists(WHISPER):
         print("manca whisper-stream: brew install whisper-cpp", file=sys.stderr)

@@ -102,6 +102,15 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
             print("badge in un verso                : \(uni)")
             print("badge in conversazione           : \(bi)")
             if uni != "pt→it" || bi != "pt⇄it" { ok = false }
+            // la finestra deve finire sullo schermo che stai guardando: con
+            // due monitor era finita su quello sbagliato e non si trovava
+            placeOnActiveScreen()
+            let main = NSScreen.main ?? NSScreen.screens[0]
+            let onMain = main.visibleFrame.intersects(window.frame)
+            let visible = NSScreen.screens.contains { $0.visibleFrame.intersects(window.frame) }
+            print("finestra sullo schermo principale: \(onMain)")
+            print("finestra su uno schermo visibile : \(visible)")
+            if !onMain || !visible { ok = false }
             exit(ok ? 0 : 1)
         }
 
@@ -116,13 +125,23 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         buildMenu()
     }
 
-    /// L'autosave puo' riportare la finestra su un monitor scollegato: con due
-    /// display capitava a Y=-962, invisibile. Si riporta sempre in basso al
-    /// centro dello schermo dove sta il puntatore.
+    /// All'avvio la finestra va sullo schermo che ha il menu, cioe' quello che
+    /// stai guardando. Prima seguiva il puntatore: con due monitor bastava
+    /// avere il mouse sull'altro schermo per non vederla comparire.
     func placeOnActiveScreen() {
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
-            ?? NSScreen.main ?? NSScreen.screens[0]
+        place(on: NSScreen.main ?? NSScreen.screens[0])
+    }
+
+    /// Riporta la finestra sullo schermo che ha il menu, cioe' quello che stai
+    /// guardando. Con due monitor la finestra finiva dove stava il puntatore e
+    /// da li' non si trovava piu': serve un modo di richiamarla senza cercarla.
+    @objc func recallWindow() {
+        place(on: NSScreen.main ?? NSScreen.screens[0])
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func place(on screen: NSScreen) {
         let vf = screen.visibleFrame
         var f = window.frame
         f.size.width = min(f.width, vf.width - 60)
@@ -198,6 +217,8 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         let main = NSMenu()
         let appItem = NSMenuItem(); main.addItem(appItem)
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Portala qui",
+                        action: #selector(recallWindow), keyEquivalent: "j")
         appMenu.addItem(withTitle: "Sempre in primo piano",
                         action: #selector(togglePin), keyEquivalent: "p")
         appMenu.addItem(withTitle: "Ricarica", action: #selector(reload), keyEquivalent: "r")
@@ -218,6 +239,14 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    /// Click sull'icona nel Dock quando non ci sono finestre visibili: con due
+    /// monitor la finestra puo' essere finita su quello che non stai
+    /// guardando, e cliccare l'icona e' il gesto con cui la si cerca.
+    func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows f: Bool) -> Bool {
+        recallWindow()
+        return true
+    }
 
     /// Chiudere la finestra deve spegnere anche il motore. Senza questo il
     /// backend lanciato con nohup dal launcher restava orfano: una volta e'
