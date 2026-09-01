@@ -36,7 +36,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-# il launcher tiene vivo il server anche se l'app viene chiusa e riaperta
+# il launcher riusa il server se e' gia' su, altrimenti lo avvia. Chiudendo
+# l'app il server si spegne da solo: prima restava orfano a trascrivere per ore.
 cat > "$APP/Contents/MacOS/launcher" <<'SH'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")/../../.." && pwd)"

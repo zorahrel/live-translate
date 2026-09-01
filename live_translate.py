@@ -8,6 +8,7 @@ La cronologia e' persistente su disco (JSONL) e si riapre a ogni avvio.
 Uso:  live-translate [--src pt] [--dst it] [--model turbo] [--port 8777]
 """
 import argparse
+import atexit
 import json
 import os
 import queue
@@ -270,7 +271,11 @@ stop_flag = threading.Event()
 history: "list" = []
 proc_lock = threading.Lock()
 whisper_proc = None
+argos_proc = None
 gen = 0
+# quando l'ultimo lettore se ne va: il motore resta acceso ancora un po', perche'
+# una ricarica della pagina stacca e riattacca la SSE nel giro di un secondo
+last_client_gone = None
 # prefisso unico per processo: senza, gli id delle righe nuove collidono con
 # quelli gia' in cronologia e la vista sovrascrive le righe vecchie
 RUN_ID = format(int(time.time()) % 100000, "05d")
@@ -446,6 +451,7 @@ def _t_argos(text: str) -> str:
 
 def start_argos() -> None:
     """Avvia il server locale se il venv c'e' e non e' gia' in ascolto."""
+    global argos_proc
     venv = os.path.join(HERE, ".venv", "bin", "python")
     script = os.path.join(HERE, "argos_translate.py")
     if not (os.path.exists(venv) and os.path.exists(script)):
@@ -456,8 +462,10 @@ def start_argos() -> None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        subprocess.Popen([venv, script, str(ARGOS_PORT)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # si tiene il riferimento solo se l'abbiamo avviato noi: un argos gia'
+        # acceso da un'altra istanza non e' nostro e non va spento uscendo
+        argos_proc = subprocess.Popen([venv, script, str(ARGOS_PORT)],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1263,6 +1271,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path == "/quit":
+            # la finestra si sta chiudendo: si risponde prima di spegnere,
+            # altrimenti il client vede solo una connessione caduta
+            self._json({"ok": True})
+            threading.Thread(target=shutdown, daemon=True).start()
+            return
         if self.path == "/speak":
             n = int(self.headers.get("Content-Length", 0))
             try:
@@ -1396,6 +1410,50 @@ def open_window(url: str) -> None:
     subprocess.run(["open", url])
 
 
+def shutdown() -> None:
+    """Spegne motore e traduttore. Idempotente: la si chiama da piu' strade."""
+    stop_flag.set()
+    with proc_lock:
+        if whisper_proc and whisper_proc.poll() is None:
+            whisper_proc.send_signal(signal.SIGINT)
+            try:
+                whisper_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                whisper_proc.kill()
+    # argos e' un processo separato: senza questo restava acceso a vita, 280 MB
+    # a tenere in RAM i modelli di traduzione per nessuno
+    if argos_proc and argos_proc.poll() is None:
+        argos_proc.terminate()
+        try:
+            argos_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            argos_proc.kill()
+
+
+def watchdog(grace: int) -> None:
+    """Esce quando nessuno guarda piu' l'overlay da 'grace' secondi.
+
+    La finestra si chiude ma il server no: restava un whisper-stream a
+    trascrivere il microfono per ore, 720 MB e la ventola accesa, scrivendo
+    una cronologia che nessuno avrebbe letto. Il segnale di 'nessuno guarda'
+    e' la lista dei subscriber SSE: la pagina aperta ne tiene esattamente uno.
+    """
+    global last_client_gone
+    while not stop_flag.is_set():
+        time.sleep(5)
+        with sub_lock:
+            alive = len(subscribers)
+        if alive:
+            last_client_gone = None
+            continue
+        if last_client_gone is None:
+            last_client_gone = time.time()
+        elif time.time() - last_client_gone > grace:
+            print(f"nessun client da {grace}s: esco", file=sys.stderr)
+            shutdown()
+            return
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8777)
@@ -1411,6 +1469,8 @@ def main() -> int:
     ap.add_argument("--no-stream", action="store_true",
                     help="attende la fine frase invece di trascrivere mentre si parla")
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--idle-exit", type=int, default=90, metavar="SEC",
+                    help="esce dopo N secondi senza nessuno che guarda (0 = mai)")
     args = ap.parse_args()
     CFG.update(src=args.src, dst=args.dst, model=args.model, capture=args.capture,
                bidi=args.bidi, langA=args.src if args.src != "auto" else "pt", langB=args.dst,
@@ -1431,23 +1491,25 @@ def main() -> int:
     threading.Thread(target=translator_thread, daemon=True).start()
     start_whisper()
 
+    # chiudere la finestra deve spegnere il motore: se il processo viene ucciso
+    # senza questo, whisper e argos restano orfani a macinare
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: shutdown())
+    atexit.register(shutdown)
+    if args.idle_exit > 0:
+        threading.Thread(target=watchdog, args=(args.idle_exit,), daemon=True).start()
+
     url = f"http://127.0.0.1:{args.port}/"
     print(f"overlay: {url}   {CFG['src']} -> {CFG['dst']}   modello {CFG['model']}")
     print(f"cronologia: {SESSION_FILE}")
     if not args.no_open:
         open_window(url)
     try:
-        while True:
+        while not stop_flag.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         pass
-    stop_flag.set()
-    if whisper_proc and whisper_proc.poll() is None:
-        whisper_proc.send_signal(signal.SIGINT)
-        try:
-            whisper_proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            whisper_proc.kill()
+    shutdown()
     return 0
 
 

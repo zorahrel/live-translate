@@ -136,6 +136,21 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    /// Chiudere la finestra deve spegnere anche il motore. Senza questo il
+    /// backend lanciato con nohup dal launcher restava orfano: una volta e'
+    /// rimasto 26 ore a trascrivere il microfono a vuoto, 720 MB e la ventola.
+    /// La WKWebView muore con l'app, quindi la SSE cade e anche il watchdog
+    /// lato server chiuderebbe: questo e' solo la strada rapida e pulita.
+    func applicationWillTerminate(_ n: Notification) {
+        guard let url = URL(string: "http://127.0.0.1:\(PORT)/quit") else { return }
+        var r = URLRequest(url: url)
+        r.httpMethod = "POST"
+        r.timeoutInterval = 2
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: r) { _, _, _ in sem.signal() }.resume()
+        _ = sem.wait(timeout: .now() + 2)
+    }
 }
 
 let app = NSApplication.shared

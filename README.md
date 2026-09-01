@@ -36,7 +36,14 @@ open LiveTranslate.app               # finestra nel Dock, con pin
 ./live-translate --src es --dst en   # altra coppia di lingue
 ./live-translate --tts               # legge le traduzioni ad alta voce
 ./live-translate --capture 3         # audio di sistema invece del microfono
+./live-translate --idle-exit 0       # non spegnerti quando la finestra si chiude
 ```
+
+Chiudere la finestra spegne il motore. Whisper tiene 700 MB e macina il
+microfono in continuo: lasciarlo acceso a vuoto costa RAM e ventola per una
+cronologia che nessuno leggerà. Se nessuno guarda l'overlay per 90 secondi il
+processo esce da solo, argos compreso; `--idle-exit` cambia la soglia, `0` la
+toglie per chi vuole tenerlo su in background.
 
 Dalla barra si cambiano **a caldo** lingue, modello di trascrizione e volume del
 microfono, senza riavviare. Il VU meter accanto allo slider dice se il microfono
