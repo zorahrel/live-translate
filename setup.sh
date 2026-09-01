@@ -67,6 +67,9 @@ else
   [ -d .venv ] || "$PY" -m venv .venv
   ./.venv/bin/pip install -q --upgrade pip
   ./.venv/bin/pip install -q argostranslate
+  # giudice esterno per verify.py: senza, il riconoscimento lingua si
+  # misurerebbe con le stesse liste che deve verificare
+  ./.venv/bin/pip install -q langdetect
   SRC="${LT_SETUP_SRC:-pt}"; DST="${LT_SETUP_DST:-it}"
   ./.venv/bin/python - "$SRC" "$DST" <<'PY'
 import sys
