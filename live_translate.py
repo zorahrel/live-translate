@@ -1048,7 +1048,10 @@ def route(text: str):
             wide = guess_lang(text, [b] + others, margin=1)
             if wide and wide != b:
                 sc = score_lang(text, (a, b))
-                netto = sc.get(b, 0) > 0 and sc.get(b, 0) > sc.get(a, 0)
+                sh = {c: sum(1 for r in SHAPE_RE.get(c, []) if r.search(text))
+                      for c in (a, b)}
+                netto = ((sc.get(b, 0) > 0 and sc.get(b, 0) > sc.get(a, 0))
+                         or (sh[b] > 0 and sh[b] > sh[a]))
                 if not netto:
                     return a, b, f"terza lingua ({wide})"
     if g:

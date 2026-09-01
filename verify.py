@@ -20,6 +20,13 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 
+# langdetect vive nel venv del progetto: e' il giudice esterno del
+# riconoscimento lingua, e senza di lui quel controllo non si puo' fare
+_venv = os.path.join(HERE, ".venv", "lib")
+for _d in glob.glob(os.path.join(_venv, "python3*", "site-packages")):
+    if _d not in sys.path:
+        sys.path.append(_d)
+
 spec = importlib.util.spec_from_file_location("lt", "live_translate.py")
 lt = importlib.util.module_from_spec(spec)
 _argv, sys.argv = sys.argv, ["verify"]
@@ -101,23 +108,41 @@ IT = re.compile(r"(?i)\b(che|non|però|perché|sono|siamo|questo|questa|quello|g
                 r"davvero|niente|sempre|anche|come|molto)\b")
 PT = re.compile(r"(?i)\b(você|não|obrigad|tudo bem|pra|isso|aqui|está|são|muito|nós|eles)\b")
 EN = re.compile(r"(?i)\b(the|and|i'm|going|you|that's|what's|don't|it's|we're)\b")
-it_veri = [r["src"] for r in rows if r.get("srcLang") == "it" and IT.search(r["src"])
-           and not PT.search(r["src"]) and len(r["src"].split()) >= 3]
-pt_veri = [r["src"] for r in rows if PT.search(r["src"]) and not EN.search(r["src"])
-           and not IT.search(r["src"]) and len(r["src"].split()) >= 3]
 en_veri = [r["src"] for r in rows if len(EN.findall(r["src"])) >= 2
            and not PT.search(r["src"]) and not IT.search(r["src"])
            and len(r["src"].split()) >= 3]
-for nome, corpus, atteso, soglia in (("italiano", it_veri, "it", 2.0),
-                                     ("portoghese", pt_veri, "pt", 0.5)):
-    sb = [t for t in corpus if lt.route(t)[0] != atteso]
-    pct = 100 * len(sb) / max(1, len(corpus))
-    check(f"{nome} parlato al microfono sotto il {soglia}% di errore", pct <= soglia,
-          f"{len(sb)}/{len(corpus)} = {pct:.2f}%")
 inv = [t for t in en_veri if lt.route(t)[0] != "pt"]
 pct_en = 100 * len(inv) / max(1, len(en_veri))
 check("l'inglese in mezzo non ribalta la direzione", pct_en <= 2.0,
       f"{len(inv)}/{len(en_veri)} = {pct_en:.2f}%")
+
+# Il giudice deve essere esterno: selezionare le frasi italiane con le stesse
+# parole che il riconoscitore usa per riconoscerle da' un 1,41% che non vuol
+# dire niente (la sovrapposizione era del 100%). langdetect e' addestrato
+# altrove e non sa niente delle liste qui dentro: giudica lui.
+try:
+    from langdetect import DetectorFactory, detect_langs
+    DetectorFactory.seed = 0
+    gold = {"it": [], "pt": []}
+    for r in rows:
+        t = r["src"]
+        if len(t.split()) < 4:
+            continue
+        try:
+            b = detect_langs(t)[0]
+        except Exception:  # noqa: BLE001
+            continue
+        if b.prob >= 0.99 and b.lang in gold:
+            gold[b.lang].append(t)
+    for lang, soglia in (("it", 14.0), ("pt", 2.0)):
+        corpus = gold[lang]
+        sb = [t for t in corpus if lt.route(t)[0] != lang]
+        pct = 100 * len(sb) / max(1, len(corpus))
+        check(f"{lang} giudicato da langdetect sotto il {soglia}%", pct <= soglia,
+              f"{len(sb)}/{len(corpus)} = {pct:.2f}%")
+except ImportError:
+    check("langdetect disponibile come giudice terzo", False,
+          "manca: .venv/bin/pip install langdetect")
 
 lt.CFG.update(bidi=False)
 dev = sum(1 for r in rows if lt.route(r["src"])[0] != "pt")
