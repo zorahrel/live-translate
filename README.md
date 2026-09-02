@@ -32,6 +32,7 @@ Per verificare che tutto regga dopo una modifica:
 ```bash
 ./verify.py            # esce non-zero se qualcosa si rompe
 ./verify.py --ciclo    # aggiunge chiusura e riapertura (spegne l'app aperta)
+./verify.py --drag     # trascina la finestra con eventi veri (vedi sotto)
 ```
 
 Il riconoscimento della lingua si misura su `goldset.json`, un campione di
@@ -39,6 +40,29 @@ frasi vere prese dalla cronologia dove **due** giudici esterni concordano:
 langdetect e il correttore ortografico di macOS. Uno solo non basta, langdetect
 chiama 'italiano' del portoghese nel 4% dei casi. Si ricostruisce con
 `.venv/bin/python build_goldset.py` quando la cronologia cresce.
+
+Un numero solo su quel campione pero' media rami che non si assomigliano.
+`.venv/bin/python error_by_branch.py` lo spacca per come la direzione e' stata
+decisa, leggendo il ramo che ogni riga di cronologia si porta dietro:
+
+| ramo | quota dell'italiano | errore | cosa e' |
+|---|---|---|---|
+| `parole` | 78,8% | **0%** (0/404) | guarda il testo |
+| `whisper` | 17,9% | 3,3% (3/92) | si fida della lingua del chunk |
+| `default` | 2,9% | **100%** (15/15) | non decide: tiene la direzione principale |
+
+`default` non e' un ramo che sbaglia spesso, e' un ramo che sull'italiano
+sbaglia **sempre**, per costruzione. Da solo fa i tre quarti dell'errore
+italiano (2,92 punti su 3,90): quello che conta non e' la sua percentuale, e'
+quanto parlato ci finisce dentro. E' il ramo su cui lavorare, non `parole`, che
+e' gia' a zero.
+
+Due avvertenze che lo strumento stampa da solo. La **copertura**: `default` ha
+un'etichetta su 16 righe (6%), quindi il suo numero e' una voce, non una
+misura. E il fatto che rilanciare `route()` su un file di testo **non e'** il
+router vivo: la lingua rilevata da whisper esiste solo mentre l'app ascolta, e
+senza 8 delle 31 frasi che contano come errore nel 5,39% dal vivo erano state
+decise bene.
 
 ## Uso
 
@@ -160,6 +184,37 @@ La chiave si può mettere anche in un `.env` accanto allo script.
   Generali → Lingua e Zona → Lingue tradotte.
 - Con audio molto rumoroso whisper allucina; i tag `[MÚSICA]`, i ringraziamenti
   tipici e le lingue terze rilevate sul rumore sono filtrati.
+- La misura della lingua vale sulla **trascrizione**, non sull'audio: se whisper
+  impasta una frase italiana in qualcosa che sembra portoghese, i due giudici
+  dicono portoghese e il router risulta "giusto" su una riga sbagliata. La
+  cronologia non conserva l'audio, quindi questo si puo' dichiarare ma non
+  misurare.
+
+## Trascinamento: la prova col permesso
+
+`./verify.py` prova che la finestra **si puo'** spostare, con `setFrameOrigin`.
+Ma `setFrameOrigin` e' proprio la strada che `performDrag` non percorre: se il
+trascinamento si rompesse dentro `performDrag`, quella riga resterebbe verde.
+
+`./verify.py --drag` preme davvero sulla striscia con eventi di mouse veri e
+guarda se la finestra segue. Per un secondo muove il puntatore. Serve un
+permesso di sistema: da Mojave, postare eventi sintetici richiede
+
+> **Impostazioni di Sistema → Privacy e sicurezza → Accessibilità → aggiungi
+> `LiveTranslate.app` e accendi l'interruttore.**
+
+Senza, il test si dichiara `[salt]` e non conta ne' come passato ne' come
+rotto: un test verde perche' non e' stato eseguito e' peggio di un buco
+dichiarato. Nota: l'app e' firmata ad-hoc, quindi dopo un `./build-app.sh`
+macOS puo' considerare stantia l'autorizzazione — se torna `[salt]` da
+autorizzata, spegni e riaccendi l'interruttore.
+
+Questa prova ha gia' pagato: alla prima esecuzione ha trovato la striscia di
+trascinamento posizionata sulle misure iniziali della finestra (1020x480)
+invece che su quelle vere ripristinate dall'autosave (1193x738). Restava a
+mezz'aria in mezzo alla pagina, in alto non c'era niente da afferrare — e
+l'autodiagnosi diceva "ok", perche' cercava la striscia alle stesse coordinate
+con cui l'aveva messa: la prova e il difetto condividevano la costante.
 
 ## Licenza
 

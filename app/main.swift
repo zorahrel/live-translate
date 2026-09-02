@@ -1,3 +1,4 @@
+import ApplicationServices
 import Cocoa
 import WebKit
 
@@ -67,21 +68,40 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
 
         // la striscia di trascinamento sta sopra il web: la pagina lascia
         // vuoti i primi 26px proprio per questo (vedi #drag nel CSS)
-        let bar = DragBar(frame: NSRect(x: 0, y: rect.height - dragHeight,
-                                        width: rect.width, height: dragHeight))
+        // misurata su root, non su `rect`: `rect` e' la dimensione di partenza,
+        // ma assegnare root a contentView lo ha gia' ridimensionato alla
+        // finestra vera, che setFrameAutosaveName ripristina com'era l'ultima
+        // volta. Con `rect` la striscia nasceva a 26px dal bordo di una
+        // finestra 1020x480 che non esiste piu': su una finestra 1193x738
+        // restava a mezz'aria in mezzo alla pagina, e in alto non c'era niente
+        // da afferrare. L'autoresizing la tiene su solo DOPO, non la rimette a
+        // posto se parte sbagliata.
+        let bar = DragBar(frame: NSRect(x: 0, y: root.bounds.height - dragHeight,
+                                        width: root.bounds.width, height: dragHeight))
         bar.autoresizingMask = [.width, .minYMargin]
         root.addSubview(bar, positioned: .above, relativeTo: web)
-        // autodiagnosi: LT_SELFTEST=1 stampa lo stato della striscia e esce,
-        // perche' simulare un trascinamento vero richiede i permessi di
-        // accessibilita' che una shell non ha
+        // autodiagnosi: LT_SELFTEST=1 stampa lo stato della striscia e esce.
+        // Prova tutto quello che si puo' provare senza toccare il mouse: che la
+        // striscia esista, che raccolga il click, che la finestra sia
+        // spostabile. Il gesto vero - premere e trascinare - sta in
+        // LT_DRAGTEST=1 piu' sotto, perche' chiede un permesso di sistema.
         if ProcessInfo.processInfo.environment["LT_SELFTEST"] == "1" {
-            let hit = root.hitTest(NSPoint(x: rect.width / 2,
-                                           y: rect.height - dragHeight / 2))
-            let below = root.hitTest(NSPoint(x: rect.width / 2, y: 50))
+            // sondato sulla finestra vera, non su `rect`: cercando la striscia
+            // alle coordinate con cui l'avevamo messa, la si trova sempre -
+            // anche quando e' finita in mezzo alla pagina e in alto non c'e'
+            // niente. E' l'errore che ha lasciato passare la striscia orfana:
+            // la prova e il difetto condividevano la costante.
+            let hit = root.hitTest(NSPoint(x: root.bounds.midX,
+                                           y: root.bounds.height - dragHeight / 2))
+            let below = root.hitTest(NSPoint(x: root.bounds.midX, y: 50))
+            // e larga quanto la finestra: agli angoli si trascina come al centro
+            let piena = abs(bar.frame.width - root.bounds.width) < 1
+                && abs(bar.frame.maxY - root.bounds.height) < 1
             var ok = root.subviews.contains(bar) && hit === bar && below !== bar
-                && bar.mouseDownCanMoveWindow
+                && bar.mouseDownCanMoveWindow && piena
             print("striscia trovata nella gerarchia : \(root.subviews.contains(bar))")
             print("click in alto colpisce la striscia: \(hit === bar)")
+            print("striscia larga quanto la finestra: \(piena)")
             print("click sul testo la evita         : \(below !== bar)")
             print("puo' muovere la finestra         : \(bar.mouseDownCanMoveWindow)")
             print("finestra spostabile dallo sfondo : \(window.isMovableByWindowBackground)")
@@ -138,8 +158,115 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
         placeOnActiveScreen()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // il gesto vero, non il suo prerequisito: vedi dragTest()
+        if ProcessInfo.processInfo.environment["LT_DRAGTEST"] == "1" {
+            dragTest()
+            return
+        }
         load()
         buildMenu()
+    }
+
+    /// Preme sulla striscia, trascina, rilascia - con eventi veri, e guarda se
+    /// la finestra ha seguito il puntatore.
+    ///
+    /// L'autodiagnosi qui sopra prova tutto tranne l'ultimo anello: sposta la
+    /// finestra con `setFrameOrigin`, che e' proprio la strada che `performDrag`
+    /// NON percorre. Se il trascinamento si rompesse dentro `performDrag`
+    /// resterebbe verde. L'unico modo di provarlo e' postare eventi di mouse
+    /// veri e vedere il frame cambiare da solo.
+    ///
+    /// Il prezzo e' un permesso: da macOS Mojave, postare eventi sintetici
+    /// richiede che il processo sia in Impostazioni di Sistema > Privacy e
+    /// sicurezza > Accessibilita'. Senza, `CGEvent.post` viene ingoiato in
+    /// silenzio e il test passerebbe... fallendo. Quindi si controlla prima, e
+    /// se il permesso manca il test si dichiara SALTATO con codice 2: saltato
+    /// non e' verde, e verify.py lo stampa diverso da un successo.
+    ///
+    /// Gira su un thread di sfondo perche' `performDrag` si prende il thread
+    /// principale in un suo ciclo di eventi finche' non arriva il rilascio: se
+    /// postassimo da li', gli eventi non li leggerebbe nessuno.
+    func dragTest() {
+        // lanciata con `open` l'app non ha uno stdout da leggere: l'esito va
+        // anche su file, e chi ha lanciato lo raccoglie di li'
+        func esito(_ code: Int32, _ righe: [String]) -> Never {
+            for r in righe { print(r) }
+            if let p = ProcessInfo.processInfo.environment["LT_DRAGTEST_OUT"] {
+                let stato = code == 0 ? "ok" : (code == 2 ? "saltato" : "rotto")
+                let j = try? JSONSerialization.data(
+                    withJSONObject: ["stato": stato, "righe": righe])
+                try? j?.write(to: URL(fileURLWithPath: p))
+            }
+            exit(code)
+        }
+        guard AXIsProcessTrusted() else {
+            esito(2, ["SALTATO: manca il permesso di Accessibilita'",
+                      "  Impostazioni di Sistema > Privacy e sicurezza > "
+                      + "Accessibilita' > aggiungi LiveTranslate.app"])
+        }
+        // al centro dello schermo: vicino a un bordo il window server limita lo
+        // spostamento e il test fallirebbe per la geometria, non per il drag
+        let vis = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+        window.setFrameOrigin(NSPoint(x: vis.midX - window.frame.width / 2,
+                                      y: vis.midY - window.frame.height / 2))
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.2) {
+            var start = NSPoint.zero
+            var bar = NSPoint.zero
+            DispatchQueue.main.sync {
+                start = self.window.frame.origin
+                // il punto da premere: meta' della striscia, lontano dai
+                // semafori a sinistra
+                bar = NSPoint(x: self.window.frame.midX,
+                              y: self.window.frame.maxY - dragHeight / 2)
+            }
+            // Cocoa conta la y dal basso, CoreGraphics dall'alto dello schermo
+            // principale: senza questa conversione si preme fuori dalla finestra
+            let flip = NSScreen.screens[0].frame.height
+            let from = CGPoint(x: bar.x, y: flip - bar.y)
+            let dx: CGFloat = 90, dy: CGFloat = 45   // dy in giu' sullo schermo
+
+            func post(_ type: CGEventType, _ p: CGPoint) {
+                let e = CGEvent(mouseEventSource: nil, mouseType: type,
+                                mouseCursorPosition: p, mouseButton: .left)
+                e?.post(tap: .cghidEventTap)
+            }
+            post(.mouseMoved, from)
+            usleep(120_000)
+            post(.leftMouseDown, from)
+            usleep(120_000)
+            // a passi: un solo salto puo' essere scartato come rumore, e il
+            // ciclo di trascinamento vuole vedere il movimento continuo
+            for i in 1...6 {
+                let f = CGFloat(i) / 6
+                post(.leftMouseDragged, CGPoint(x: from.x + dx * f, y: from.y + dy * f))
+                usleep(40_000)
+            }
+            // l'ultimo spostamento va ribadito e lasciato assestare: postato a
+            // ridosso del rilascio veniva accorpato, e la finestra si fermava
+            // un passo indietro. Non e' il trascinamento che perde colpi, e'
+            // questa prova che parla troppo in fretta - un dito vero si ferma
+            // prima di alzarsi.
+            let fine = CGPoint(x: from.x + dx, y: from.y + dy)
+            post(.leftMouseDragged, fine)
+            usleep(250_000)
+            post(.leftMouseUp, fine)
+            usleep(300_000)
+
+            var end = NSPoint.zero
+            DispatchQueue.main.sync { end = self.window.frame.origin }
+            let gotX = end.x - start.x
+            let gotY = end.y - start.y          // in Cocoa scende = negativo
+            // tolleranza larga: il window server aggancia di qualche pixel e
+            // qui interessa che la finestra abbia seguito, non l'aritmetica
+            let ok = abs(gotX - dx) <= 4 && abs(gotY + dy) <= 4
+            DispatchQueue.main.sync { self.window.setFrameOrigin(start) }
+            esito(ok ? 0 : 1,
+                  ["trascinata dalla striscia        : \(ok)",
+                   "  chiesto dx=\(Int(dx)) dy=\(Int(-dy)), "
+                   + "ottenuto dx=\(Int(gotX)) dy=\(Int(gotY))"])
+        }
     }
 
     /// All'avvio la finestra va sullo schermo che ha il menu, cioe' quello che

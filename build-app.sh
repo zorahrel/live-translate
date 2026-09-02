@@ -42,6 +42,9 @@ cat > "$APP/Contents/MacOS/launcher" <<'SH'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 PORT="${LT_PORT:-8777}"
+# la prova del trascinamento apre solo la finestra e esce: il motore non
+# c'entra, e accenderlo lascerebbe whisper acceso per niente
+if [ "${LT_DRAGTEST:-}" = "1" ]; then exec "$(dirname "$0")/LiveTranslate"; fi
 if ! curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/"; then
   cd "$DIR" && nohup /usr/bin/python3 live_translate.py --no-open --port "$PORT" \
     > /tmp/live-translate.log 2>&1 &

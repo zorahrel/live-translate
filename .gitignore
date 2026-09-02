@@ -13,3 +13,4 @@ apple_translate
 *.log
 .DS_Store
 .prefs.json
+__pycache__/

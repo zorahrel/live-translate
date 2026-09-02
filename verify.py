@@ -136,6 +136,58 @@ else:
     check("il campione di riferimento esiste", False,
           "manca goldset.json: .venv/bin/python build_goldset.py")
 
+# Le due righe qui sopra rilanciano route() su un file di testo, e li' la lingua
+# rilevata da whisper non esiste: il ramo `whisper` non puo' scattare e 8 delle
+# 31 frasi che contano come errore, dal vivo, erano state decise bene. Quindi
+# quel 5,39% non e' l'errore del router, e' l'errore del router meno un pezzo.
+# Qui invece si legge cosa e' successo davvero: ogni riga di cronologia porta il
+# ramo che l'ha decisa. Dettaglio completo: .venv/bin/python error_by_branch.py
+head("in conversazione, ogni ramo del router preso da solo")
+if os.path.exists(GOLD):
+    import error_by_branch as ebr
+
+    st = ebr.tabella([{**r, "_testo": " ".join(r["src"].split()),
+                       "_ramo": ebr.famiglia(r.get("how")),
+                       "_vero": {t: L for L in ("it", "pt") for t in gold[L]}.get(
+                           " ".join(r["src"].split()))} for r in rows])
+
+    def ramo(nome, lingua):
+        n, e = st[nome]["per_lingua"].get(lingua, [0, 0]) if nome in st else (0, 0)
+        return n, e
+
+    n, e = ramo("parole", "it")
+    check("il ramo che guarda le parole non sbaglia l'italiano",
+          n >= 300 and e == 0, f"{e}/{n}")
+    n, e = ramo("parole", "pt")
+    check("il ramo che guarda le parole, sotto l'1% sul portoghese",
+          n >= 500 and 100 * e / max(1, n) <= 1.0, f"{e}/{n} = {100 * e / max(1, n):.2f}%")
+
+    # `default` non decide: tiene la direzione principale. Su una frase italiana
+    # e' quindi sbagliato sempre, e infatti e' 15 su 15. Non c'e' una soglia di
+    # errore da sorvegliare - c'e' da sorvegliare quanto italiano ci finisce.
+    it_tot = sum(st[k]["per_lingua"].get("it", [0, 0])[0] for k in st if k != "fisso")
+    n, e = ramo("default", "it")
+    quota = 100 * n / max(1, it_tot)
+    check("quasi nessuna frase italiana finisce nel ramo che non decide",
+          quota <= 4.0, f"{n}/{it_tot} = {quota:.1f}% (e li' sbaglia {e}/{n})")
+
+    for lingua, soglia in (("it", 4.5), ("pt", 1.2)):
+        tot = sum(st[k]["per_lingua"].get(lingua, [0, 0])[0] for k in st if k != "fisso")
+        err = sum(st[k]["per_lingua"].get(lingua, [0, 0])[1] for k in st if k != "fisso")
+        pct = 100 * err / max(1, tot)
+        lo, hi = ebr.wilson(err, tot)
+        check(f"{lingua}, come e' andata davvero in conversazione, sotto il {soglia}%",
+              pct <= soglia, f"{err}/{tot} = {pct:.2f}% (95%: {lo:.1f}-{hi:.1f}%)")
+
+    # La misura vale solo dove arriva: se la copertura del campione crolla, il
+    # numero qui sopra sta descrivendo una fetta sempre piu' piccola del parlato.
+    bidi = [k for k in st if k != "fisso"]
+    righe_b = sum(st[k]["righe"] for k in bidi)
+    et_b = sum(st[k]["et"] for k in bidi)
+    check("il campione copre almeno meta' del parlato in conversazione",
+          100 * et_b / max(1, righe_b) >= 50, f"{et_b}/{righe_b} = "
+          f"{100 * et_b / max(1, righe_b):.0f}% etichettate")
+
 lt.CFG.update(bidi=False)
 dev = sum(1 for r in rows if lt.route(r["src"])[0] != "pt")
 check("con il bidirezionale spento non si inverte mai", dev == 0,
@@ -168,6 +220,36 @@ if os.path.exists(appbin):
     check("l'autodiagnosi dell'app passa", r.returncode == 0, f"exit={r.returncode}")
 else:
     check("l'app e' stata costruita", False, "manca LiveTranslate.app")
+
+# Il trascinamento vero: sopra si prova che la finestra SI PUO' spostare
+# (setFrameOrigin), che e' l'unica strada che performDrag non percorre. Qui si
+# preme davvero sulla striscia con eventi di mouse veri. Serve un permesso di
+# sistema, quindi non gira da solo: ./verify.py --drag. Muove il puntatore per
+# un secondo, per questo non sta nel giro normale.
+if "--drag" in sys.argv:
+    head("il trascinamento, con eventi di mouse veri")
+    out = "/tmp/lt-dragtest.json"
+    if os.path.exists(out):
+        os.remove(out)
+    subprocess.run(["open", "-n", "-W", "--env", "LT_DRAGTEST=1",
+                    "--env", f"LT_DRAGTEST_OUT={out}", "LiveTranslate.app"],
+                   capture_output=True, timeout=90)
+    if not os.path.exists(out):
+        check("la prova del trascinamento ha risposto", False,
+              "nessun esito: l'app non e' partita")
+    else:
+        res = json.load(open(out))
+        dettaglio = " ".join(r.strip() for r in res["righe"][1:])
+        if res["stato"] == "saltato":
+            # saltato non e' verde: si stampa diverso da un ok e diverso da un
+            # rotto, perche' non sappiamo se il gesto funziona - non l'abbiamo
+            # provato. Un test che passa perche' non e' stato eseguito e'
+            # peggio di un buco dichiarato, e non entra nel conto dei rotti
+            # ne' in quello dei passati.
+            print("  [salt] la finestra segue il puntatore  (permesso mancante)")
+            print(f"         {dettaglio}")
+        else:
+            check("la finestra segue il puntatore", res["stato"] == "ok", dettaglio)
 
 # ------------------------------------------------------------------- motore
 head("il motore acceso adesso")
