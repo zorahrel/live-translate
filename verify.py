@@ -223,33 +223,90 @@ else:
 
 # Il trascinamento vero: sopra si prova che la finestra SI PUO' spostare
 # (setFrameOrigin), che e' l'unica strada che performDrag non percorre. Qui si
-# preme davvero sulla striscia con eventi di mouse veri. Serve un permesso di
-# sistema, quindi non gira da solo: ./verify.py --drag. Muove il puntatore per
-# un secondo, per questo non sta nel giro normale.
+# preme davvero sulla striscia con eventi di mouse veri. Muove il puntatore per
+# un secondo, per questo non sta nel giro normale: ./verify.py --drag.
+#
+# Postare eventi sintetici richiede il permesso di Accessibilita', e quel
+# permesso e' PER PROGRAMMA, non per utente. Da qui le due strade:
+#
+#   binario diretto  LiveTranslate.app/Contents/MacOS/LiveTranslate lanciato
+#       come figlio della shell: eredita l'autorizzazione di chi ha aperto il
+#       terminale, quindi la prova gira senza che nessuno tocchi un
+#       interruttore, e non si spegne a ogni ./build-app.sh (la firma e'
+#       ad-hoc: cambia a ogni compilazione, e macOS considera stantia
+#       l'autorizzazione concessa al bundle). Prova la meccanica del gesto
+#       sotto l'identita' del terminale.
+#   app vera         `open -n`: figlia di launchd, identita' TCC propria
+#       (com.livetranslate.app). E' il percorso d'uso reale, e l'unico che un
+#       interruttore in Impostazioni accende - ma va riacceso quando la firma
+#       cambia.
+#
+# Di norma si prende la prima e si ripiega sulla seconda solo se anche la shell
+# non e' autorizzata. `--drag --bundle` forza la seconda: passata fedele da
+# fare quando si tocca il codice della finestra.
+DRAG_VIE = {
+    "binario diretto": ["LiveTranslate.app/Contents/MacOS/LiveTranslate"],
+    "app vera": ["open", "-n", "-W", "LiveTranslate.app"],
+}
+
+
+def prova_drag(via: str) -> dict:
+    """Esegue la prova per una strada e torna l'esito, {} se non ha risposto."""
+    out = f"/tmp/lt-dragtest-{via.replace(' ', '-')}.json"
+    if os.path.exists(out):
+        os.remove(out)          # un esito vecchio si spaccerebbe per nuovo
+    cmd = list(DRAG_VIE[via])
+    env = None
+    if cmd[0] == "open":
+        # `open` non passa il suo ambiente all'app: le variabili vanno dette a
+        # lui, una --env per volta
+        cmd += ["--env", "LT_DRAGTEST=1", "--env", f"LT_DRAGTEST_OUT={out}"]
+    else:
+        env = dict(os.environ, LT_DRAGTEST="1", LT_DRAGTEST_OUT=out)
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=90, env=env)
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if not os.path.exists(out):
+        return {}
+    res = json.load(open(out))
+    res["via"] = via
+    return res
+
+
 if "--drag" in sys.argv:
     head("il trascinamento, con eventi di mouse veri")
-    out = "/tmp/lt-dragtest.json"
-    if os.path.exists(out):
-        os.remove(out)
-    subprocess.run(["open", "-n", "-W", "--env", "LT_DRAGTEST=1",
-                    "--env", f"LT_DRAGTEST_OUT={out}", "LiveTranslate.app"],
-                   capture_output=True, timeout=90)
-    if not os.path.exists(out):
-        check("la prova del trascinamento ha risposto", False,
-              "nessun esito: l'app non e' partita")
+    if "--bundle" in sys.argv:
+        vie = ["app vera"]
     else:
-        res = json.load(open(out))
+        vie = ["binario diretto", "app vera"]
+    res, saltate = {}, []
+    for via in vie:
+        res = prova_drag(via)
+        # si ripiega solo su un SALTATO: un rotto e' una risposta, e riprovare
+        # altrove servirebbe solo a cercarne una piu' comoda
+        if res and res["stato"] != "saltato":
+            break
+        saltate.append(f"{via}: {'non ha risposto' if not res else 'non autorizzato'}")
+    if not res:
+        check("la prova del trascinamento ha risposto", False,
+              "; ".join(saltate) or "nessun esito")
+    elif res["stato"] == "saltato":
+        # saltato non e' verde: si stampa diverso da un ok e diverso da un
+        # rotto, perche' non sappiamo se il gesto funziona - non l'abbiamo
+        # provato. Un test che passa perche' non e' stato eseguito e' peggio di
+        # un buco dichiarato, e non entra nel conto dei rotti ne' dei passati.
+        print("  [salt] la finestra segue il puntatore  (permesso mancante)")
+        print(f"         {'; '.join(saltate)}")
+        print("         Impostazioni di Sistema > Privacy e sicurezza > "
+              "Accessibilita': aggiungi LiveTranslate.app,")
+        print("         oppure il terminale da cui lanci ./verify.py --drag")
+    else:
         dettaglio = " ".join(r.strip() for r in res["righe"][1:])
-        if res["stato"] == "saltato":
-            # saltato non e' verde: si stampa diverso da un ok e diverso da un
-            # rotto, perche' non sappiamo se il gesto funziona - non l'abbiamo
-            # provato. Un test che passa perche' non e' stato eseguito e'
-            # peggio di un buco dichiarato, e non entra nel conto dei rotti
-            # ne' in quello dei passati.
-            print("  [salt] la finestra segue il puntatore  (permesso mancante)")
-            print(f"         {dettaglio}")
-        else:
-            check("la finestra segue il puntatore", res["stato"] == "ok", dettaglio)
+        check("la finestra segue il puntatore", res["stato"] == "ok",
+              f"{dettaglio}, via {res['via']}")
+        for s in saltate:
+            print(f"         (ripiegato: {s})")
 
 # ------------------------------------------------------------------- motore
 head("il motore acceso adesso")

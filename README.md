@@ -33,6 +33,7 @@ Per verificare che tutto regga dopo una modifica:
 ./verify.py            # esce non-zero se qualcosa si rompe
 ./verify.py --ciclo    # aggiunge chiusura e riapertura (spegne l'app aperta)
 ./verify.py --drag     # trascina la finestra con eventi veri (vedi sotto)
+./verify.py --drag --bundle   # come app vera: chiede il permesso al bundle
 ```
 
 Il riconoscimento della lingua si misura su `goldset.json`, un campione di
@@ -197,17 +198,39 @@ Ma `setFrameOrigin` e' proprio la strada che `performDrag` non percorre: se il
 trascinamento si rompesse dentro `performDrag`, quella riga resterebbe verde.
 
 `./verify.py --drag` preme davvero sulla striscia con eventi di mouse veri e
-guarda se la finestra segue. Per un secondo muove il puntatore. Serve un
-permesso di sistema: da Mojave, postare eventi sintetici richiede
+guarda se la finestra segue. Per un secondo muove il puntatore. Postare eventi
+sintetici richiede, da Mojave, il permesso di Accessibilita' — e quel permesso
+e' **per programma**, non per utente. Da qui due strade:
 
-> **Impostazioni di Sistema → Privacy e sicurezza → Accessibilità → aggiungi
-> `LiveTranslate.app` e accendi l'interruttore.**
+| strada | chi deve essere autorizzato | quando si usa |
+|---|---|---|
+| binario diretto (default) | il **terminale** da cui lanci: il figlio eredita | sempre, gira senza toccare interruttori |
+| app vera (`--drag --bundle`) | **LiveTranslate.app** | passata fedele quando tocchi il codice della finestra |
 
-Senza, il test si dichiara `[salt]` e non conta ne' come passato ne' come
-rotto: un test verde perche' non e' stato eseguito e' peggio di un buco
-dichiarato. Nota: l'app e' firmata ad-hoc, quindi dopo un `./build-app.sh`
-macOS puo' considerare stantia l'autorizzazione — se torna `[salt]` da
-autorizzata, spegni e riaccendi l'interruttore.
+Il default lancia `LiveTranslate.app/Contents/MacOS/LiveTranslate` come figlio
+della shell: eredita l'autorizzazione di chi ha aperto il terminale, quindi non
+chiede niente a nessuno e **non si spegne a ogni `./build-app.sh`** — la firma
+e' ad-hoc, cambia a ogni compilazione, e macOS considera stantia
+l'autorizzazione data al bundle. Il prezzo e' che prova la meccanica del gesto
+sotto l'identita' del terminale: per «l'app autorizzata trascina» serve
+`--drag --bundle`, che passa da `open -n` (figlio di launchd, identita' TCC
+propria) ed e' il percorso d'uso reale.
+
+Se la prima strada non e' autorizzata si ripiega da sola sulla seconda. Il
+ripiego scatta **solo su un saltato**: un rotto e' una risposta, e riprovare
+altrove servirebbe solo a cercarne una piu' comoda.
+
+Quando nessuna delle due e' autorizzata il test si dichiara `[salt]` e non
+conta ne' come passato ne' come rotto: un test verde perche' non e' stato
+eseguito e' peggio di un buco dichiarato.
+
+I denti sono verificati al contrario, che e' l'unico modo di sapere che un test
+possa fallire: togliendo `performDrag` da `mouseDown` e rimettendo la striscia
+sulla costante vecchia, la riga diventa rossa con `dx=0 dy=0`; sul codice buono
+torna `dx=90 dy=-45`. Attenzione a cosa **non** copre: `isMovable = false` e
+`isMovableByWindowBackground = false` non la fanno arrossire, perche'
+`performDrag` scavalca entrambi i flag — quelli li guarda l'autodiagnosi, con
+le sue righe apposta.
 
 Questa prova ha gia' pagato: alla prima esecuzione ha trovato la striscia di
 trascinamento posizionata sulle misure iniziali della finestra (1020x480)

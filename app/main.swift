@@ -201,9 +201,14 @@ final class Delegate: NSObject, NSApplicationDelegate, WKNavigationDelegate,
             exit(code)
         }
         guard AXIsProcessTrusted() else {
+            // il permesso e' per programma: chi va autorizzato dipende da come
+            // questa prova e' stata lanciata. Come app vera e' LiveTranslate;
+            // come binario figlio di una shell e' il terminale, che presta al
+            // figlio la propria autorizzazione.
             esito(2, ["SALTATO: manca il permesso di Accessibilita'",
                       "  Impostazioni di Sistema > Privacy e sicurezza > "
-                      + "Accessibilita' > aggiungi LiveTranslate.app"])
+                      + "Accessibilita': LiveTranslate.app se lanciata come "
+                      + "app, il terminale se lanciata da li'"])
         }
         // al centro dello schermo: vicino a un bordo il window server limita lo
         // spostamento e il test fallirebbe per la geometria, non per il drag
