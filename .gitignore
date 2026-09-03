@@ -5,10 +5,15 @@ history/
 .backends_dead.json
 .env
 
+# il campione di misura: sono frasi di conversazioni vere, restano sulla
+# macchina di chi le ha dette. Si ricostruisce con build_goldset.py.
+goldset.json
+
 # artefatti di build
 app/LiveTranslate
 LiveTranslate.app/
 apple_translate
+tools/spellcount
 
 *.log
 .DS_Store

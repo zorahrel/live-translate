@@ -39,8 +39,13 @@ Per verificare che tutto regga dopo una modifica:
 Il riconoscimento della lingua si misura su `goldset.json`, un campione di
 frasi vere prese dalla cronologia dove **due** giudici esterni concordano:
 langdetect e il correttore ortografico di macOS. Uno solo non basta, langdetect
-chiama 'italiano' del portoghese nel 4% dei casi. Si ricostruisce con
-`.venv/bin/python build_goldset.py` quando la cronologia cresce.
+chiama 'italiano' del portoghese nel 4% dei casi.
+
+Quel file **non e' nel repo**, ed e' voluto: sono frasi di conversazioni
+private, e un campione di misura non e' un motivo sufficiente per pubblicare
+quello che si sono detti due persone a cena. Ognuno costruisce il suo dalla
+propria cronologia, con `.venv/bin/python build_goldset.py`. Senza, gli
+strumenti di misura lo dicono e si fermano invece di inventare un numero.
 
 Un numero solo su quel campione pero' media rami che non si assomigliano.
 `.venv/bin/python error_by_branch.py` lo spacca per come la direzione e' stata
