@@ -244,6 +244,54 @@ mezz'aria in mezzo alla pagina, in alto non c'era niente da afferrare — e
 l'autodiagnosi diceva "ok", perche' cercava la striscia alle stesse coordinate
 con cui l'aveva messa: la prova e il difetto condividevano la costante.
 
+## Perche' e' fermo, e cosa ha insegnato
+
+Il progetto e' fermo, e vale la pena dire perche' invece di lasciarlo
+scadere in silenzio: il collo di bottiglia non era il router delle lingue,
+che dopo tre misure era arrivato a **0% di errore su 404 frasi** nel ramo
+che guarda il testo. Era whisper, un livello piu' sotto.
+
+In una conversazione vera di 21 minuti, **il 21% delle righe trascritte era
+inglese**: `Thank you.`, `- Ready? - Try to look in there.`, roba che nessuno
+aveva detto. Whisper stava trascrivendo il silenzio e il rumore della stanza.
+E quelle righe il router le instrada come portoghese con piena confidenza,
+perche' non ha un ramo "nessuna delle due" — vede parole non italiane e
+conclude. Il campione di misura non poteva accorgersene **per costruzione**:
+teneva solo le frasi che i giudici dicevano it o pt, quindi buttava via
+esattamente il modo in cui il sistema falliva.
+
+La cosa si misura in quattro file e due comandi. Stesso audio, due motori:
+
+| audio | Apple `SpeechAnalyzer` | whisper large-v3-turbo `-l auto` |
+|---|---|---|
+| 180s di silenzio digitale | *niente* | `you you you you you I` |
+| 120s di rumore di stanza (-65 dB) | *niente* | `Thank you. Thank you. Thank you. Thank you.` |
+| 120s di rumore forte (-40 dB) | *niente* | `Thank you. Thank you. Thank you. Thank you.` |
+| frase italiana + 25s di silenzio | la frase, esatta | la frase **+ `Grazie a tutti.`** |
+
+Non e' una questione di soglie: e' architettura. Whisper e' un
+encoder-decoder autoregressivo, *deve* emettere token, e sul silenzio pesca
+il testo piu' probabile del suo addestramento — i ringraziamenti e i crediti
+dei sottotitoli su cui e' stato addestrato. Un motore streaming non ha un
+decoder da alimentare e sul silenzio non emette niente. Nessun `--vad`,
+nessun filtro a valle e nessuna lista di frasi note porta il primo dove il
+secondo parte.
+
+Le tre lezioni che restano, e che valgono piu' del codice:
+
+1. **Una misura puo' essere circolare al 100% senza che si veda.** La prima
+   versione selezionava le frasi italiane con le stesse parole che il
+   detector usa per riconoscerle: «da 4,2% a 1,41% su 426 frasi vere» non
+   valeva niente. Da li' i due giudici indipendenti di `build_goldset.py`.
+2. **Un numero solo media rami che non si assomigliano.** Spaccato per ramo,
+   `default` risultava sbagliato sull'italiano *sempre* — e faceva da solo
+   tre quarti dell'errore. Le ultime tornate di tuning stavano limando il
+   ramo che era gia' a zero.
+3. **La prova e il difetto non devono condividere una costante.** Vale per il
+   campione di misura e vale per il trascinamento della finestra: entrambi
+   dicevano "ok" perche' si controllavano con lo stesso numero con cui erano
+   stati scritti.
+
 ## Licenza
 
 MIT.
