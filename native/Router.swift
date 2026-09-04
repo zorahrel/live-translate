@@ -45,6 +45,19 @@ enum Lessico {
     }
 }
 
+/// Quanto si concede all'altro trascrittore quando a chiudere per primo e'
+/// quello che NON guidava sui provvisori.
+///
+/// Sta qui per la stessa ragione del router, e per una ragione in piu': era
+/// cablato in due posti, `1200` nell'app e `1200` nel banco, mentre il banco
+/// STAMPAVA `700` perche' aveva una sua variabile che nessuno leggeva. Un
+/// numero scritto due volte diverge; una manopola che stampa un valore che non
+/// applica e' peggio, perche' fa attribuire alla manopola la varianza del caso.
+@MainActor
+enum Politica {
+    static var attesaAltroMs: Int = 1200
+}
+
 /// L'esito del confronto fra i due testi.
 struct Verdetto {
     let lingua: String      // "it" | "pt"

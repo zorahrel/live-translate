@@ -27,10 +27,11 @@ import AVFoundation
 import AppKit
 
 let veloce = CommandLine.arguments.contains("--veloce")
-let attesaMs: Int = {
+/// nil = si tiene quella dell'app, che e' il punto di un banco
+let attesaCLI: Int? = {
     if let i = CommandLine.arguments.firstIndex(of: "--attesa"),
-       i + 1 < CommandLine.arguments.count { return Int(CommandLine.arguments[i+1]) ?? 700 }
-    return 700
+       i + 1 < CommandLine.arguments.count { return Int(CommandLine.arguments[i+1]) }
+    return nil
 }()
 let files = CommandLine.arguments.dropFirst().filter { $0.hasSuffix(".wav") }.sorted()
 
@@ -94,7 +95,10 @@ final class Banco {
                             }
                         }
                     }
-                } catch { }
+                } catch {
+                    FileHandle.standardError.write(
+                        Data("trascrittore \(breve) interrotto: \(error)\n".utf8))
+                }
             }
             tasks.append(task)
         }
@@ -169,9 +173,26 @@ final class Banco {
         tFine = Date()
     }
 
+    /// Taglia la frase su ENTRAMBI i trascrittori prima di passare al file
+    /// successivo. Senza, `azzera()` ripulisce solo la contabilita' del banco e
+    /// i trascrittori tirano avanti con la loro segmentazione: uno che non ha
+    /// ancora chiuso si porta dietro l'audio dei file precedenti e li scarica
+    /// tutti insieme piu' tardi. Misurato: una riga conteneva tre frasi di tre
+    /// file diversi, e la sbagliava per colpa delle altre due.
+    /// Non si aspetta il ritorno di `finalize`: misurato, senza altro audio in
+    /// arrivo puo' non tornare MAI — il banco si e' impiantato al sesto file su
+    /// ventiquattro, a CPU zero, dopo cinque andati lisci. Si lancia e gli si
+    /// da' mezzo secondo di stanza vuota, che e' l'input con cui raggiunge il
+    /// confine. Quello che arriva tardi lo butta l'`azzera()` del giro dopo.
+    func tagliaFrase() async {
+        for (_, a) in analyzers { Task { try? await a.finalize(through: nil) } }
+        await fruscio(5)
+    }
+
     func azzera() {
         primoParziale.removeAll(); finale.removeAll(); testoFinale.removeAll()
         vive.removeAll(); capofila = nil; tChiusura = nil; verdetto = nil
+        vistoIt = ""; vistoPt = ""; daParzialeIt = false; daParzialePt = false
         attesa?.cancel(); attesa = nil
     }
 
@@ -184,11 +205,15 @@ final class Banco {
         attesa?.cancel()
         if testoFinale.count == lingue.count || lingua == capofila { chiudi(); return }
         attesa = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(1200))
+            try? await Task.sleep(for: .milliseconds(Politica.attesaAltroMs))
             guard !Task.isCancelled else { return }
             await self?.chiudi()
         }
     }
+
+    /// cosa aveva davanti il router quando ha deciso: senza, una riga "NO" dice
+    /// che ha sbagliato e non cosa ha visto, che e' l'unica meta' azionabile
+    var vistoIt = "", vistoPt = "", daParzialeIt = false, daParzialePt = false
 
     func chiudi() {
         guard verdetto == nil else { return }
@@ -196,6 +221,8 @@ final class Banco {
         let it = testoFinale["it"] ?? vive["it"] ?? ""
         let pt = testoFinale["pt"] ?? vive["pt"] ?? ""
         guard !(it.isEmpty && pt.isEmpty) else { return }
+        vistoIt = it; vistoPt = pt
+        daParzialeIt = testoFinale["it"] == nil; daParzialePt = testoFinale["pt"] == nil
         verdetto = Router.decidi(it: it, pt: pt)
         tChiusura = Date().timeIntervalSince(tFine)
     }
@@ -219,7 +246,9 @@ struct Main {
         // due secondi di stanza vuota prima di cominciare, come all'accensione
         await b.fruscio(20)
 
-        print("modo: \(veloce ? "volatili + rapidi" : "solo finali (com'era)") · attesa altro trascrittore: \(attesaMs) ms")
+        if let a = attesaCLI { await MainActor.run { Politica.attesaAltroMs = a } }
+        let attesaVera = await MainActor.run { Politica.attesaAltroMs }
+        print("modo: \(veloce ? "volatili + rapidi" : "solo finali (com'era)") · attesa altro trascrittore: \(attesaVera) ms\(attesaCLI == nil ? " (quella dell'app)" : " (forzata)")")
         print(String(repeating: "-", count: 76))
         print("file        atteso deciso   1º testo it  1º testo pt   finale it  finale pt")
 
@@ -234,6 +263,7 @@ struct Main {
             do { try await b.riproduci(f) } catch { print("\(nome): \(error)"); continue }
             await b.fruscio(70, finoAllaChiusura: true)
             await b.chiudi()
+            await b.tagliaFrase()
 
             let vinto = await b.verdetto?.lingua ?? "–"
             if vinto == atteso { giusti += 1 }
@@ -246,6 +276,12 @@ struct Main {
 
             func opt(_ v: TimeInterval?) -> String { v.map { ms($0) } ?? "    –" }
             print("\(nome.padding(toLength: 10, withPad: " ", startingAt: 0))  \(atteso)     \(vinto) \(vinto == atteso ? "ok " : "NO ")   \(opt(pIt))        \(opt(pPt))       \(opt(fIt))      \(opt(fPt))")
+            if vinto != atteso {
+                let vIt = await b.vistoIt, vPt = await b.vistoPt
+                let sIt = await b.daParzialeIt ? "parz" : "fin ", sPt = await b.daParzialePt ? "parz" : "fin "
+                print("            it \(sIt) «\(vIt)»")
+                print("            pt \(sPt) «\(vPt)»")
+            }
         }
 
         print(String(repeating: "-", count: 76))

@@ -310,11 +310,13 @@ ortografico di sistema riconosce come proprie; a parita', chi ne ha di piu'
 esclusive. Il router sta in `Router.swift`, compilato **sia dall'app sia dal
 banco di misura**: il banco non ne ha una copia, o misurerebbe la copia.
 
-### Il banco, e i tre modi in cui una misura di latenza puo' mentire
+### Il banco, e i sei modi in cui una misura di latenza puo' mentire
 
 `native/bench` rimpiazza il microfono con file audio riprodotti a velocita'
-reale. Tre cose sono state necessarie perche' misurasse qualcosa invece di
-tacere, e nessuna era prevedibile:
+reale. Sei cose sono state necessarie perche' misurasse qualcosa invece di
+tacere o di mentire, e nessuna era prevedibile.
+
+Le prime tre lo facevano **tacere**:
 
 - la cadenza va tenuta su una **scadenza assoluta**: con `sleep(100ms)` in un
   ciclo che fa anche altro si arriva a dare 3,5 s di audio in 5,4 s, e i tempi
@@ -325,13 +327,60 @@ tacere, e nessuna era prevedibile:
   elenca gia' come installati**: senza, i trascrittori partono, non danno
   errore, e non producono niente.
 
+Le altre tre lo facevano **mentire**, ed erano peggio, perche' un banco che
+tace lo vedi:
+
+- `--attesa` stampava un valore che **non applicava**: la politica di chiusura
+  aveva `1200` cablato in due posti, l'app e il banco, mentre il banco
+  annunciava `700`. Tre passate con manopole diverse davano numeri diversi, e i
+  numeri erano solo la varianza del caso — la manopola non era collegata a
+  niente. Ora la costante sta in `Politica.attesaAltroMs` dentro `Router.swift`,
+  che compilano entrambi;
+- le frasi **colavano da un file all'altro**: `azzera()` ripuliva la
+  contabilita' del banco, non i trascrittori, che tirano avanti con la loro
+  segmentazione. Una riga sbagliata conteneva tre frasi di tre file diversi
+  (`«E spera un poqui. Esto morta de cansasso. E bom.»`) e le sbagliava tutte
+  per colpa delle altre due. Serve tagliare la frase con `finalize(through:)`
+  su entrambi;
+- ma `finalize(through:)` **non torna mai** se non arriva altro audio: aspettarlo
+  impiantava il banco al sesto file su ventiquattro, a CPU zero, dopo cinque
+  andati lisci. Si lancia senza aspettarlo e gli si da' mezzo secondo di
+  fruscio, che e' l'input con cui raggiunge il confine.
+
+E una riga rossa deve dire **cosa ha visto**, non solo che ha sbagliato: sotto
+ogni `NO` il banco stampa i due testi e se venivano da un definitivo o da un
+provvisorio. Senza, si tira a indovinare su un correttore ortografico che e'
+una scatola nera.
+
 ### Cosa e' cambiato, misurato con lo stesso banco
 
-| | prima | dopo |
+24 frasi, 12 italiane e 12 portoghesi, di quelle che si dicono davvero a cena
+(«Va bene dai», «Espera um pouquinho», «Ti ho comprato un regalo ma non te lo
+dico ancora»). Stesso binario, stessi file, due modi:
+
+| | prima (solo finali) | dopo (volatili + rapidi) |
 |---|---|---|
-| primo testo mentre parli | **mai** | **879 ms** |
-| riga pubblicata dopo che hai smesso | 7203 ms | **3501 ms** |
-| lingua indovinata | 4/6 | **6/6** |
+| primo testo mentre parli | **mai** | **706 ms** |
+| testo definitivo dopo che hai smesso | 6887 ms | **3651 ms** |
+| riga pubblicata dopo che hai smesso | 7284 ms | **3717 ms** |
+| lingua indovinata | 21/24 | 20/24 |
+
+L'ultima riga e' quella che conta piu' delle altre, e dice il contrario di
+quello che c'era scritto qui prima. La versione precedente di questo README
+annunciava «lingua indovinata da 4/6 a 6/6» e lo attribuiva a `.fastResults`:
+era **una passata fortunata su sei frasi**. Le stesse sei, rilanciate tre
+volte, hanno dato 5/6, 6/6 e 4/6 — e la manopola con cui credevo di averle
+stabilizzate era quella scollegata. Su ventiquattro frasi i risultati rapidi
+**non migliorano il riconoscimento della lingua**: lo lasciano dov'era. Fanno
+arrivare il testo prima, che era il punto; non lo fanno arrivare piu' giusto.
+
+Le tre-quattro righe che cadono sono sempre la stessa cosa, e adesso si legge:
+frasi **corte**, dove i due trascrittori producono testi che valgono uguale.
+`«E spera un pochino.»` contro `«Espera um pouquinho»` fa due parole valide
+per parte, e a quel punto decide un criterio di spareggio che su un pareggio
+pieno tiene l'italiano. Non lo tocco qui apposta: ho ventiquattro frasi, e
+tarare lo spareggio su di loro sarebbe la circolarita' con cui questo progetto
+si e' aperto, alla terza occorrenza.
 
 La leva e' una sola opzione: `.fastResults` accanto a `.volatileResults`.
 `volatileResults` da solo **non basta** — senza il compagno il primo testo non
@@ -372,10 +421,15 @@ diretta senza far uscire un suono.
 
 ### Cosa non e' ancora misurato
 
-Il 6/6 e il 20/20 di prima sono **voci sintetiche su audio pulito**, senza
+Il 21/24 e il 20/20 di prima sono **voci sintetiche su audio pulito**, senza
 rumore e senza voci sovrapposte. Il parlato vero e' peggio, e questi numeri
 vanno rifatti li'. E la latenza e' misurata dal banco, che alimenta i
 trascrittori da file: il microfono vero aggiunge la sua, non misurata.
+
+Ventiquattro frasi restano poche: fra 20/24 e 21/24 non c'e' differenza che
+significhi qualcosa, ed e' esattamente per questo che qui sopra c'e' scritto
+«lo lasciano dov'era» invece di «peggiora leggermente». Un campione che non sa
+distinguere due numeri non ha il diritto di ordinarli.
 
 ## Licenza
 

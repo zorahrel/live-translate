@@ -94,7 +94,13 @@ final class Motore {
                         if r.isFinal { await self?.definitivo(lingua: breve, testo: s) }
                         else { await self?.provvisorio(lingua: breve, testo: s) }
                     }
-                } catch { }
+                } catch {
+                    // un catch vuoto qui fa sembrare SILENZIOSO un motore che sta
+                    // invece fallendo: e' il modo piu' veloce di passare un'ora a
+                    // cercare un guasto nell'audio che sta nello stream
+                    FileHandle.standardError.write(
+                        Data("trascrittore \(breve) interrotto: \(error)\n".utf8))
+                }
             }
             tasks.append(task)
         }
@@ -291,7 +297,7 @@ final class Motore {
             chiudi(); return
         }
         attesaChiusura = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(1200))
+            try? await Task.sleep(for: .milliseconds(Politica.attesaAltroMs))
             guard !Task.isCancelled else { return }
             await self?.chiudi()
         }
