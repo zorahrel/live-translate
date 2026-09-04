@@ -5,6 +5,7 @@
   <key>CFBundleDisplayName</key><string>Due Voci</string>
   <key>CFBundleIdentifier</key><string>com.zorahrel.duevoci</string>
   <key>CFBundleExecutable</key><string>DueVoci</string>
+  <key>CFBundleIconFile</key><string>DueVoci</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>

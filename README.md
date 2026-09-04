@@ -15,12 +15,31 @@ funziona, ed e' quello da cui partire.
 ## Due Voci
 
 ```bash
-native/build.sh          # compila l'app e il banco di misura
-open native/DueVoci.app  # premi Ascolta, o barra spaziatrice
+native/build.sh     # compila l'app, il banco di misura e l'icona
+native/installa.sh  # la mette in /Applications e la aggancia al Dock
 ```
 
 macOS 26 o superiore, Apple Silicon. Nessuna dipendenza da installare: i
-modelli sono quelli del sistema.
+modelli sono quelli del sistema. Poi si apre dal Dock e si preme Ascolta, o la
+barra spaziatrice.
+
+<p align="center"><img src="docs/duevoci-icona.png" width="128" alt="l'icona: due bolle sovrapposte, blu e verde"></p>
+
+L'icona sono due bolle, blu e verde: gli stessi due colori con cui l'app segna
+chi ha parlato. Senza lettere dentro — le lingue si scelgono a runtime, e un
+`IT/PT` stampato sarebbe una bugia appena qualcuno cambia coppia. La disegna
+`native/icona.swift` e `build.sh` la rifa' solo quando quel file cambia.
+
+`installa.sh` copia con `ditto`, non con `cp -R`: da certi filesystem `cp`
+semina file AppleDouble (`._*`) dentro il bundle, e quelli **invalidano il
+sigillo della firma** — l'app risulta "danneggiata" mentre nel sorgente la
+firma e' intatta. Costato una volta, su un'altra app.
+
+**Il permesso del microfono non sopravvive all'installazione**, ed e' voluto
+da macOS, non un difetto qui: la firma e' ad-hoc, cambia a ogni compilazione, e
+al primo Ascolta dalla copia installata TCC dice `Failed to match existing code
+requirement` e richiede il consenso da capo. Una volta sola, e si concede dal
+dialogo che compare.
 
 **L'idea, in una riga.** Le app che fanno questo traducono in UNA direzione,
 perche' il caso normale e' "guardo un video straniero"; due persone che si

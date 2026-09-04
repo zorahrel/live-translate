@@ -25,3 +25,6 @@ native/DueVoci
 native/bench
 native/DueVoci.app/Contents/MacOS/
 native/DueVoci.app/Contents/_CodeSignature/
+
+# l'icona la rifa' build.sh da icona.swift: e' un artefatto, non un sorgente
+native/DueVoci.app/Contents/Resources/
