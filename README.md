@@ -292,6 +292,91 @@ Le tre lezioni che restano, e che valgono piu' del codice:
    dicevano "ok" perche' si controllavano con lo stesso numero con cui erano
    stati scritti.
 
+## Due Voci — il seguito, su un motore che non allucina
+
+`native/` e' la ripartenza dopo quella misura: stessa idea, motore diverso.
+Trascrizione con `SpeechAnalyzer` di macOS 26 e traduzione con
+`Translation.framework`, tutto in locale, **76 MB di RAM** contro i 547 del
+solo modello whisper. Si costruisce con `native/build.sh`.
+
+La differenza rispetto a tutte le app che fanno questo: quelle traducono in
+UNA direzione, perche' il caso normale e' "guardo un video straniero". Qui
+girano **due trascrittori sullo stesso microfono**, uno italiano e uno
+portoghese, e chi ha parlato si decide confrontando quello che hanno capito.
+Quello sbagliato non produce parole sbagliate — produce frammenti: dove il
+portoghese sente `Ontem à noite eu falei com a minha mãe no telefone`,
+l'italiano sente `a noi con`. Vince chi ha piu' parole che il correttore
+ortografico di sistema riconosce come proprie; a parita', chi ne ha di piu'
+esclusive. Il router sta in `Router.swift`, compilato **sia dall'app sia dal
+banco di misura**: il banco non ne ha una copia, o misurerebbe la copia.
+
+### Il banco, e i tre modi in cui una misura di latenza puo' mentire
+
+`native/bench` rimpiazza il microfono con file audio riprodotti a velocita'
+reale. Tre cose sono state necessarie perche' misurasse qualcosa invece di
+tacere, e nessuna era prevedibile:
+
+- la cadenza va tenuta su una **scadenza assoluta**: con `sleep(100ms)` in un
+  ciclo che fa anche altro si arriva a dare 3,5 s di audio in 5,4 s, e i tempi
+  misurati diventano i tempi del banco;
+- il silenzio fra le frasi dev'essere **fruscio, non zero digitale**: un
+  microfono vero non produce mai zeri;
+- i modelli vanno chiesti con `AssetInventory` **anche quando il sistema li
+  elenca gia' come installati**: senza, i trascrittori partono, non danno
+  errore, e non producono niente.
+
+### Cosa e' cambiato, misurato con lo stesso banco
+
+| | prima | dopo |
+|---|---|---|
+| primo testo mentre parli | **mai** | **879 ms** |
+| riga pubblicata dopo che hai smesso | 7203 ms | **3501 ms** |
+| lingua indovinata | 4/6 | **6/6** |
+
+La leva e' una sola opzione: `.fastResults` accanto a `.volatileResults`.
+`volatileResults` da solo **non basta** — senza il compagno il primo testo non
+arriva mai mentre parli. Sta scritto qui perche' non e' deducibile
+dall'API: si vede solo aprendo `SpeechTranscriber.Preset.progressiveTranscription`
+e guardando cosa contiene.
+
+Il resto della latenza e' politica di chiusura. I due trascrittori non
+finalizzano insieme: misurato, da 30 ms a 2 secondi di scarto. Aspettare
+sempre il secondo costerebbe quei 2 secondi a ogni frase; non aspettarlo mai
+vorrebbe dire decidere con meta' delle prove. Quindi si guarda chi guidava
+**sui provvisori**: se a chiudere e' lui, la prova c'e' gia' e si pubblica
+subito; se e' l'altro, si concedono 1,2 s. Chi non ha ancora chiuso viene
+giudicato sull'ultimo provvisorio, che e' cio' che ha capito anche se non
+l'ha ancora dichiarato.
+
+### Due trappole del framework, pagate
+
+`downloadAndInstall()` chiamato dal thread principale **non torna mai**: l'app
+resta ferma su quella riga per sempre. Lo stesso identico codice in un binario
+da terminale, che non e' isolato sul main, dura 0,2 s. Non e' lentezza, e' un
+blocco — in `DueVoci.swift` la chiamata e' `nonisolated` apposta.
+
+E i risultati vanno consumati con `for try await`: l'errore dello stream, se
+lo si ingoia con un `catch {}` vuoto, fa sembrare "silenzioso" un motore che
+sta invece fallendo.
+
+### Vederla funzionare senza parlare
+
+```bash
+open -n --env DV_PROVA=/percorso/frase1.wav:/percorso/frase2.wav native/DueVoci.app
+```
+
+Da' in pasto i file invece del microfono, alla velocita' con cui sarebbero
+stati pronunciati, e parte da solo. Serve a controllare che l'app funzioni
+prima di sedersi a tavola con qualcuno — e a fotografare la striscia in
+diretta senza far uscire un suono.
+
+### Cosa non e' ancora misurato
+
+Il 6/6 e il 20/20 di prima sono **voci sintetiche su audio pulito**, senza
+rumore e senza voci sovrapposte. Il parlato vero e' peggio, e questi numeri
+vanno rifatti li'. E la latenza e' misurata dal banco, che alimenta i
+trascrittori da file: il microfono vero aggiunge la sua, non misurata.
+
 ## Licenza
 
 MIT.

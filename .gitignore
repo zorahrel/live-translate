@@ -19,3 +19,9 @@ tools/spellcount
 .DS_Store
 .prefs.json
 __pycache__/
+
+# Due Voci: binari compilati, si rifanno con native/build.sh
+native/DueVoci
+native/bench
+native/DueVoci.app/Contents/MacOS/
+native/DueVoci.app/Contents/_CodeSignature/
