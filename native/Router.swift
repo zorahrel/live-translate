@@ -1,4 +1,4 @@
-// Il router: chi ha parlato, italiano o portoghese.
+// Il router: quale delle due lingue ha parlato.
 //
 // Sta in un file suo perche' lo compilano DUE binari — l'app e il banco di
 // misura. Se il banco ne avesse una copia, misurerebbe la copia: la lezione
@@ -16,9 +16,79 @@
 import Foundation
 import AppKit
 
-/// Il giudice lessicale: quante parole di un testo sono valide in una lingua.
-/// E' il correttore ortografico di macOS, che ha entrambi i dizionari e non sa
-/// niente di quale trascrittore ha prodotto il testo.
+// ------------------------------------------------------------------ le lingue
+
+/// Una lingua utilizzabile in Due Voci. Servono TRE cose che la conoscano, e
+/// solo due si vedono: il trascrittore (`asr`) e il traduttore. La terza e' il
+/// correttore ortografico (`corr`), che qui non fa da correttore ma da giudice
+/// — e senza di lui il router non ha nessuno a cui chiedere.
+struct Lingua: Identifiable, Hashable {
+    /// identificatore del `SpeechTranscriber`, es. "pt-BR"
+    let asr: String
+    /// codice del correttore ortografico, es. "pt_BR". Non e' lo stesso:
+    /// il correttore usa l'underscore, e per certe lingue ha solo il codice
+    /// base ("it" per it-CH, che l'ASR distingue e lui no).
+    let corr: String
+
+    var id: String { asr }
+    /// "pt-BR" → "pt"
+    var codice: String { String(asr.prefix(while: { $0 != "-" })) }
+    /// il nome nella lingua dell'utente, es. "portoghese (Brasile)"
+    var nome: String {
+        Locale.current.localizedString(forIdentifier: asr) ?? asr
+    }
+}
+
+/// Quali lingue si possono davvero scegliere.
+///
+/// Il filtro che conta e' il correttore, ed e' il motivo per cui questo
+/// catalogo esiste invece di offrire tutto quello che sa trascrivere l'ASR:
+/// `checkSpelling` con un codice che non conosce **non fallisce, dice si' a
+/// tutto**. Misurato — la stessa frase italiana da' 7 parole valide chiesta in
+/// "it", e 7 chiesta in "ja" o in "zz". Un router costruito su un giudice cosi'
+/// non sbaglia: smette proprio di decidere, e nessuno se ne accorge.
+/// Su questo Mac restano fuori giapponese e cinese, che l'ASR trascrive e il
+/// correttore non conosce.
+enum Catalogo {
+    /// Il codice con cui chiamare il correttore per una lingua dell'ASR, o
+    /// `nil` se il correttore non la conosce affatto.
+    static func correttorePer(_ asr: String, disponibili: Set<String>) -> String? {
+        let piatto = asr.replacingOccurrences(of: "-", with: "_")
+        let base = String(asr.prefix(while: { $0 != "-" }))
+        if disponibili.contains(piatto) { return piatto }
+        if disponibili.contains(base) { return base }
+        // it-CH non ha "it_CH"; pt-BR sceglie pt_BR sopra; se resta solo una
+        // variante regionale della stessa lingua, vale come giudice
+        return disponibili.first { $0.hasPrefix(base + "_") }
+    }
+
+    @MainActor
+    static func costruisci(_ identificatoriASR: [String]) -> [Lingua] {
+        let disponibili = Set(NSSpellChecker.shared.availableLanguages)
+        return identificatoriASR.compactMap { id in
+            correttorePer(id, disponibili: disponibili).map { Lingua(asr: id, corr: $0) }
+        }
+        .sorted { $0.nome.localizedCompare($1.nome) == .orderedAscending }
+    }
+
+    /// La coppia di partenza, quando non c'e' niente di salvato.
+    static let predefinite = ("it-IT", "pt-BR")
+}
+
+/// Le due targhette. Normalmente il codice della lingua — IT, PT, ES — ma se
+/// la coppia e' fatta di due varianti della stessa (pt-BR e pt-PT, en-US e
+/// en-GB) due targhette uguali non direbbero niente, e si passa alla regione.
+func sigle(_ a: Lingua, _ b: Lingua) -> (String, String) {
+    a.codice == b.codice
+        ? (a.asr.uppercased(), b.asr.uppercased())
+        : (a.codice.uppercased(), b.codice.uppercased())
+}
+
+// ------------------------------------------------------------------ il giudice
+
+/// Quante parole di un testo sono valide in una lingua, secondo il correttore
+/// ortografico di macOS: ha i dizionari di tutte, e non sa niente di quale
+/// trascrittore ha prodotto il testo che sta giudicando.
 @MainActor
 enum Lessico {
     private static var cache: [String: Int] = [:]
@@ -60,7 +130,7 @@ enum Politica {
 
 /// L'esito del confronto fra i due testi.
 struct Verdetto {
-    let lingua: String      // "it" | "pt"
+    let lingua: Lingua
     let testo: String
     /// quanto e' stata netta: 0 = pareggio deciso all'ultimo criterio
     let margine: Int
@@ -69,30 +139,28 @@ struct Verdetto {
 @MainActor
 enum Router {
     /// Confronta quello che i due trascrittori hanno capito della stessa voce.
-    /// `it` o `pt` vuoto significa "quel trascrittore non ha prodotto niente",
+    /// Un testo vuoto significa "quel trascrittore non ha prodotto niente",
     /// che di per se' e' gia' una risposta.
-    static func decidi(it: String, pt: String) -> Verdetto {
-        if it.isEmpty && pt.isEmpty { return Verdetto(lingua: "it", testo: "", margine: 0) }
-        if it.isEmpty { return Verdetto(lingua: "pt", testo: pt, margine: 99) }
-        if pt.isEmpty { return Verdetto(lingua: "it", testo: it, margine: 99) }
+    static func decidi(_ a: Lingua, _ testoA: String,
+                       _ b: Lingua, _ testoB: String) -> Verdetto {
+        if testoA.isEmpty && testoB.isEmpty { return Verdetto(lingua: a, testo: "", margine: 0) }
+        if testoA.isEmpty { return Verdetto(lingua: b, testo: testoB, margine: 99) }
+        if testoB.isEmpty { return Verdetto(lingua: a, testo: testoA, margine: 99) }
 
-        let nIt = valide(it, "it"), nPt = valide(pt, "pt")
-        if nIt != nPt {
-            let vinceIt = nIt > nPt
-            return Verdetto(lingua: vinceIt ? "it" : "pt",
-                            testo: vinceIt ? it : pt,
-                            margine: abs(nIt - nPt))
+        let nA = Lessico.valide(testoA, lingua: a.corr)
+        let nB = Lessico.valide(testoB, lingua: b.corr)
+        if nA != nB {
+            let vinceA = nA > nB
+            return Verdetto(lingua: vinceA ? a : b,
+                            testo: vinceA ? testoA : testoB,
+                            margine: abs(nA - nB))
         }
         // pareggio: vince chi ha piu' parole ESCLUSIVE della sua lingua
-        let eIt = nIt - valide(it, "pt")
-        let ePt = nPt - valide(pt, "it")
-        let vinceIt = eIt >= ePt
-        return Verdetto(lingua: vinceIt ? "it" : "pt",
-                        testo: vinceIt ? it : pt,
+        let eA = nA - Lessico.valide(testoA, lingua: b.corr)
+        let eB = nB - Lessico.valide(testoB, lingua: a.corr)
+        let vinceA = eA >= eB
+        return Verdetto(lingua: vinceA ? a : b,
+                        testo: vinceA ? testoA : testoB,
                         margine: 0)
-    }
-
-    private static func valide(_ t: String, _ l: String) -> Int {
-        Lessico.valide(t, lingua: l == "it" ? "it" : "pt")
     }
 }

@@ -20,6 +20,10 @@
 // `--veloce` accende `.volatileResults` + `.fastResults`; senza, si misura il
 // comportamento di prima. Stesso harness per il prima e il dopo: confrontare
 // due misure prese con due strumenti diversi non e' un confronto.
+//
+// `--lingue it-IT,pt-BR` misura una coppia diversa da quella predefinita. La
+// lingua attesa di ogni file si legge dal nome: `it3.wav` deve dare la prima
+// lingua, `pt1.wav` la seconda.
 
 import Foundation
 import Speech
@@ -34,12 +38,23 @@ let attesaCLI: Int? = {
     return nil
 }()
 let files = CommandLine.arguments.dropFirst().filter { $0.hasSuffix(".wav") }.sorted()
+let coppiaCLI: (String, String)? = {
+    if let i = CommandLine.arguments.firstIndex(of: "--lingue"),
+       i + 1 < CommandLine.arguments.count {
+        let p = CommandLine.arguments[i+1].split(separator: ",").map(String.init)
+        if p.count == 2 { return (p[0], p[1]) }
+    }
+    return nil
+}()
 
 func ms(_ t: TimeInterval) -> String { String(format: "%5.0f", t * 1000) }
 
 @MainActor
 final class Banco {
-    let lingue = ["it": "it-IT", "pt": "pt-BR"]
+    let a: Lingua, b: Lingua
+    var lingue: [Lingua] { [a, b] }
+
+    init(_ a: Lingua, _ b: Lingua) { self.a = a; self.b = b }
     var analyzers: [String: SpeechAnalyzer] = [:]
     var transcribers: [String: SpeechTranscriber] = [:]
     var conts: [String: AsyncStream<AnalyzerInput>.Continuation] = [:]
@@ -61,9 +76,10 @@ final class Banco {
     private var scadenza: TimeInterval = 0
 
     func prepara() async throws {
-        for (breve, loc) in lingue {
+        for lg in lingue {
+            let breve = lg.id
             let t = SpeechTranscriber(
-                locale: Locale(identifier: loc),
+                locale: Locale(identifier: lg.asr),
                 transcriptionOptions: [],
                 reportingOptions: veloce ? [.volatileResults, .fastResults] : [],
                 attributeOptions: [])
@@ -88,9 +104,9 @@ final class Banco {
                                     self.primoParziale[breve] = Date().timeIntervalSince(self.tInizio)
                                 }
                                 self.vive[breve] = s
-                                let it = self.vive["it"] ?? "", pt = self.vive["pt"] ?? ""
-                                if !it.isEmpty || !pt.isEmpty {
-                                    self.capofila = Router.decidi(it: it, pt: pt).lingua
+                                let tA = self.vive[self.a.id] ?? "", tB = self.vive[self.b.id] ?? ""
+                                if !tA.isEmpty || !tB.isEmpty {
+                                    self.capofila = Router.decidi(self.a, tA, self.b, tB).lingua.id
                                 }
                             }
                         }
@@ -108,10 +124,10 @@ final class Banco {
         }
         fmtASR = await SpeechAnalyzer.bestAvailableAudioFormat(
             compatibleWith: Array(transcribers.values))
-        for (breve, _) in lingue {
+        for lg in lingue {
             let (st, cont) = AsyncStream<AnalyzerInput>.makeStream()
-            conts[breve] = cont
-            try await analyzers[breve]!.start(inputSequence: st)
+            conts[lg.id] = cont
+            try await analyzers[lg.id]!.start(inputSequence: st)
         }
     }
 
@@ -192,7 +208,7 @@ final class Banco {
     func azzera() {
         primoParziale.removeAll(); finale.removeAll(); testoFinale.removeAll()
         vive.removeAll(); capofila = nil; tChiusura = nil; verdetto = nil
-        vistoIt = ""; vistoPt = ""; daParzialeIt = false; daParzialePt = false
+        vistoA = ""; vistoB = ""; daParzialeA = false; daParzialeB = false
         attesa?.cancel(); attesa = nil
     }
 
@@ -213,17 +229,17 @@ final class Banco {
 
     /// cosa aveva davanti il router quando ha deciso: senza, una riga "NO" dice
     /// che ha sbagliato e non cosa ha visto, che e' l'unica meta' azionabile
-    var vistoIt = "", vistoPt = "", daParzialeIt = false, daParzialePt = false
+    var vistoA = "", vistoB = "", daParzialeA = false, daParzialeB = false
 
     func chiudi() {
         guard verdetto == nil else { return }
         attesa?.cancel()
-        let it = testoFinale["it"] ?? vive["it"] ?? ""
-        let pt = testoFinale["pt"] ?? vive["pt"] ?? ""
-        guard !(it.isEmpty && pt.isEmpty) else { return }
-        vistoIt = it; vistoPt = pt
-        daParzialeIt = testoFinale["it"] == nil; daParzialePt = testoFinale["pt"] == nil
-        verdetto = Router.decidi(it: it, pt: pt)
+        let tA = testoFinale[a.id] ?? vive[a.id] ?? ""
+        let tB = testoFinale[b.id] ?? vive[b.id] ?? ""
+        guard !(tA.isEmpty && tB.isEmpty) else { return }
+        vistoA = tA; vistoB = tB
+        daParzialeA = testoFinale[a.id] == nil; daParzialeB = testoFinale[b.id] == nil
+        verdetto = Router.decidi(a, tA, b, tB)
         tChiusura = Date().timeIntervalSince(tFine)
     }
 
@@ -237,9 +253,19 @@ final class Banco {
 struct Main {
     static func main() async {
         guard !files.isEmpty else {
-            print("uso: bench [--veloce] [--attesa ms] file1.wav …"); exit(2)
+            print("uso: bench [--veloce] [--attesa ms] [--lingue it-IT,pt-BR] file1.wav …")
+            exit(2)
         }
-        let b = await Banco()
+        // il catalogo filtra le lingue che il correttore non conosce: senza di
+        // lui il router non ha un giudice, e un giudice assente dice si' a tutto
+        let ids = coppiaCLI.map { [$0.0, $0.1] } ?? [Catalogo.predefinite.0, Catalogo.predefinite.1]
+        let scelte = await Catalogo.costruisci(ids)
+        guard scelte.count == 2 else {
+            print("coppia non utilizzabile: il correttore ortografico non conosce \(ids.filter { id in !scelte.contains { $0.id == id } }.joined(separator: " e "))")
+            exit(2)
+        }
+        let lgA = scelte.first { $0.id == ids[0] }!, lgB = scelte.first { $0.id == ids[1] }!
+        let b = await Banco(lgA, lgB)
         do { try await b.prepara() } catch {
             print("preparazione fallita: \(error)"); exit(1)
         }
@@ -249,8 +275,11 @@ struct Main {
         if let a = attesaCLI { await MainActor.run { Politica.attesaAltroMs = a } }
         let attesaVera = await MainActor.run { Politica.attesaAltroMs }
         print("modo: \(veloce ? "volatili + rapidi" : "solo finali (com'era)") · attesa altro trascrittore: \(attesaVera) ms\(attesaCLI == nil ? " (quella dell'app)" : " (forzata)")")
+        let (cA, cB) = sigle(lgA, lgB)
+        let kA = cA.lowercased(), kB = cB.lowercased()
+        print("coppia: \(lgA.nome) (\(kA)) ⇄ \(lgB.nome) (\(kB))")
         print(String(repeating: "-", count: 76))
-        print("file        atteso deciso   1º testo it  1º testo pt   finale it  finale pt")
+        print("file        atteso deciso   1º testo \(kA)  1º testo \(kB)   finale \(kA)  finale \(kB)")
 
         var parz: [TimeInterval] = [], fin: [TimeInterval] = []
         var chiusure: [TimeInterval] = []
@@ -258,29 +287,33 @@ struct Main {
 
         for f in files {
             let nome = (f as NSString).lastPathComponent
-            let atteso = nome.hasPrefix("it") ? "it" : "pt"
+            // la lingua attesa sta nel nome del file: it3.wav → prima lingua
+            let attesaA = nome.lowercased().hasPrefix(lgA.codice)
+            let atteso = attesaA ? kA : kB
+            let attesoId = attesaA ? lgA.id : lgB.id
             await b.azzera()
             do { try await b.riproduci(f) } catch { print("\(nome): \(error)"); continue }
             await b.fruscio(70, finoAllaChiusura: true)
             await b.chiudi()
             await b.tagliaFrase()
 
-            let vinto = await b.verdetto?.lingua ?? "–"
-            if vinto == atteso { giusti += 1 }
+            let vintoId = await b.verdetto?.lingua.id
+            let vinto = vintoId.map { $0 == lgA.id ? kA : kB } ?? "–"
+            if vintoId == attesoId { giusti += 1 }
             if let t = await b.tChiusura { chiusure.append(t) }
-            let pIt = await b.primoParziale["it"], pPt = await b.primoParziale["pt"]
-            let fIt = await b.finale["it"], fPt = await b.finale["pt"]
+            let pIt = await b.primoParziale[lgA.id], pPt = await b.primoParziale[lgB.id]
+            let fIt = await b.finale[lgA.id], fPt = await b.finale[lgB.id]
             // il primo testo utile e' quello del trascrittore che poi vince
-            if let v = (atteso == "it" ? pIt : pPt) { parz.append(v) }
-            if let v = (atteso == "it" ? fIt : fPt) { fin.append(v) }
+            if let v = (attesaA ? pIt : pPt) { parz.append(v) }
+            if let v = (attesaA ? fIt : fPt) { fin.append(v) }
 
             func opt(_ v: TimeInterval?) -> String { v.map { ms($0) } ?? "    –" }
-            print("\(nome.padding(toLength: 10, withPad: " ", startingAt: 0))  \(atteso)     \(vinto) \(vinto == atteso ? "ok " : "NO ")   \(opt(pIt))        \(opt(pPt))       \(opt(fIt))      \(opt(fPt))")
-            if vinto != atteso {
-                let vIt = await b.vistoIt, vPt = await b.vistoPt
-                let sIt = await b.daParzialeIt ? "parz" : "fin ", sPt = await b.daParzialePt ? "parz" : "fin "
-                print("            it \(sIt) «\(vIt)»")
-                print("            pt \(sPt) «\(vPt)»")
+            print("\(nome.padding(toLength: 10, withPad: " ", startingAt: 0))  \(atteso)     \(vinto) \(vintoId == attesoId ? "ok " : "NO ")   \(opt(pIt))        \(opt(pPt))       \(opt(fIt))      \(opt(fPt))")
+            if vintoId != attesoId {
+                let vA = await b.vistoA, vB = await b.vistoB
+                let sA = await b.daParzialeA ? "parz" : "fin ", sB = await b.daParzialeB ? "parz" : "fin "
+                print("            \(kA) \(sA) «\(vA)»")
+                print("            \(kB) \(sB) «\(vB)»")
             }
         }
 

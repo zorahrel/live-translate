@@ -9,8 +9,9 @@
 // Chi ha parlato lo decide `Router.swift`, condiviso col banco di misura.
 //
 // Tutto in locale: i modelli sono quelli di macOS, stanno fuori dal processo e
-// girano sul Neural Engine. Misurato: 16 MB di RAM contro i 547 MB del modello
-// whisper che questo progetto usava prima.
+// girano sul Neural Engine. Misurato mentre trascrive in due lingue: 37 MB di
+// footprint per l'app, piu' 34 dei servizi di sistema — contro i ~700 MB che
+// whisper teneva residenti nella versione precedente di questo progetto.
 
 import SwiftUI
 import Speech
@@ -22,12 +23,38 @@ import Translation
 /// Una frase riconosciuta, gia' attribuita a una delle due lingue.
 struct Battuta: Identifiable, Equatable {
     let id = UUID()
-    let lingua: String          // "it" | "pt"
+    let lingua: Lingua
     let originale: String
     var tradotta: String = ""
     let quando = Date()
     /// quanto e' stata netta la decisione: 0 = pareggio, alto = nessun dubbio
     let margine: Int
+}
+
+// ------------------------------------------------------------ la dimensione
+
+/// Quanto grande il testo a schermo. Quattro passi, non uno slider: a tavola
+/// non si regola un cursore, si preme una volta. L'ultimo passo serve a usarla
+/// come sottotitolo da lontano.
+enum Dimensione: Int, CaseIterable, Identifiable {
+    case piccolo = 0, medio = 1, grande = 2, enorme = 3
+    var id: Int { rawValue }
+    var nome: String {
+        switch self {
+        case .piccolo: "Piccolo"
+        case .medio:   "Medio"
+        case .grande:  "Grande"
+        case .enorme:  "Enorme"
+        }
+    }
+    var scala: CGFloat {
+        switch self {
+        case .piccolo: 0.8
+        case .medio:   1.0
+        case .grande:  1.35
+        case .enorme:  1.8
+        }
+    }
 }
 
 // ------------------------------------------------------------------ il motore
@@ -42,7 +69,7 @@ final class Motore {
 
     /// Quello che i due trascrittori stanno capendo ADESSO, mentre si parla.
     /// E' la risposta a "sta funzionando?": si vede il testo crescere prima
-    /// che la frase sia finita.
+    /// che la frase sia finita. Chiave: l'id ASR della lingua.
     var vive: [String: String] = [:]
     /// Chi dei due sta vincendo su quello che ha sentito finora.
     var capofila: String?
@@ -50,7 +77,19 @@ final class Motore {
     /// nessuno ha ancora detto una parola riconoscibile.
     var livello: Float = 0
 
-    private let engine = AVAudioEngine()
+    /// Le due lingue con cui il motore e' partito. Cambiarle vuol dire
+    /// spegnere e riaccendere: i trascrittori nascono con la loro lingua.
+    private(set) var a = Lingua(asr: "it-IT", corr: "it")
+    private(set) var b = Lingua(asr: "pt-BR", corr: "pt_BR")
+
+    // `nonisolated(unsafe)`: il microfono si accende FUORI dal main apposta —
+    // `engine.inputNode` fa un dispatch_sync interno, e se il thread principale
+    // e' fermo dentro una catena async (un cambio di lingua parte da un
+    // aggiornamento di vista) quel sync non torna piu'. Misurato: l'app
+    // congelata su "controllo i modelli", stack in `__DISPATCH_WAIT_FOR_QUEUE__`.
+    private nonisolated(unsafe) let engine = AVAudioEngine()
+    /// il microfono e' acceso? in prova da file non si tocca proprio
+    private var microfonoAcceso = false
     private var analyzers: [String: SpeechAnalyzer] = [:]
     private var transcribers: [String: SpeechTranscriber] = [:]
     private var conts: [String: AsyncStream<AnalyzerInput>.Continuation] = [:]
@@ -60,8 +99,13 @@ final class Motore {
     /// misurati, fino a 2 secondi di scarto.
     private var finali: [String: String] = [:]
     private var attesaChiusura: Task<Void, Never>?
-
-    static let lingue = ["it": "it-IT", "pt": "pt-BR"]
+    /// I trascrittori che devono ancora chiudere una frase GIA' pubblicata.
+    /// Il loro definitivo arriva in ritardo — misurato, fino a 2 secondi — e
+    /// senza questo apre una riga nuova con quello che il perdente aveva
+    /// capito: due righe per una frase sola, la seconda spazzatura nella
+    /// lingua sbagliata. Il banco non poteva vederlo, perche' taglia la frase
+    /// fra un file e l'altro; si e' visto in una schermata dell'app piena.
+    private var attesiInRitardo: Set<String> = []
 
     nonisolated static func installaModelli(_ t: [SpeechTranscriber]) async throws {
         if let req = try await AssetInventory.assetInstallationRequest(supporting: t) {
@@ -69,21 +113,22 @@ final class Motore {
         }
     }
 
-    func avvia() async {
+    func avvia(_ primaLingua: Lingua, _ secondaLingua: Lingua) async {
         guard !inAscolto else { return }
+        a = primaLingua; b = secondaLingua
         stato = "preparo i due trascrittori…"
 
-        for (breve, locale) in Self.lingue {
+        for lg in [a, b] {
             // `.fastResults` e' la differenza fra un'app che sembra rotta e
             // una che risponde: senza, il primo testo non arriva mai mentre
             // parli e il definitivo tarda 7 secondi. Con, 0,9 s e 3,8 s.
             // `.volatileResults` da solo non basta — misurato, non dedotto.
-            let t = SpeechTranscriber(locale: Locale(identifier: locale),
+            let t = SpeechTranscriber(locale: Locale(identifier: lg.asr),
                                       transcriptionOptions: [],
                                       reportingOptions: [.volatileResults, .fastResults],
                                       attributeOptions: [])
-            transcribers[breve] = t
-            analyzers[breve] = SpeechAnalyzer(modules: [t])
+            transcribers[lg.id] = t
+            analyzers[lg.id] = SpeechAnalyzer(modules: [t])
 
             let task = Task { [weak self] in
                 do {
@@ -91,15 +136,15 @@ final class Motore {
                         let s = String(r.text.characters)
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !s.isEmpty else { continue }
-                        if r.isFinal { await self?.definitivo(lingua: breve, testo: s) }
-                        else { await self?.provvisorio(lingua: breve, testo: s) }
+                        if r.isFinal { await self?.definitivo(lingua: lg.id, testo: s) }
+                        else { await self?.provvisorio(lingua: lg.id, testo: s) }
                     }
                 } catch {
                     // un catch vuoto qui fa sembrare SILENZIOSO un motore che sta
                     // invece fallendo: e' il modo piu' veloce di passare un'ora a
                     // cercare un guasto nell'audio che sta nello stream
                     FileHandle.standardError.write(
-                        Data("trascrittore \(breve) interrotto: \(error)\n".utf8))
+                        Data("trascrittore \(lg.id) interrotto: \(error)\n".utf8))
                 }
             }
             tasks.append(task)
@@ -108,7 +153,11 @@ final class Motore {
         // I modelli vanno chiesti al sistema anche quando `installedLocales`
         // li elenca gia': senza, i trascrittori partono, non danno errore e
         // non producono niente. Un'ora buttata per scoprirlo.
-        stato = "controllo i modelli di lingua…"
+        let installate = await SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) }
+        let daScaricare = [a, b].filter { !installate.contains($0.asr) }
+        stato = daScaricare.isEmpty
+            ? "controllo i modelli di lingua…"
+            : "scarico \(daScaricare.map(\.nome).joined(separator: " e "))… (una volta sola)"
         do {
             // fuori dal thread principale: da dentro, `downloadAndInstall()`
             // non torna mai — l'app resta ferma su questa riga per sempre.
@@ -116,29 +165,60 @@ final class Motore {
             // chiamata dura 0,2 s: e' un blocco, non una lentezza.
             try await Self.installaModelli(Array(transcribers.values))
         } catch {
-            stato = "modelli non disponibili: \(error.localizedDescription)"; return
+            stato = "modelli non disponibili: \(error.localizedDescription)"
+            svuotaTutto(); return
         }
 
         // il motore vuole 16 kHz interi con segno; il microfono da' 48 kHz in
         // virgola mobile, e senza conversione il framework abortisce
         guard let fmtASR = await SpeechAnalyzer.bestAvailableAudioFormat(
                 compatibleWith: Array(transcribers.values)) else {
-            stato = "nessun formato audio compatibile"; return
+            stato = "nessun formato audio compatibile"; svuotaTutto(); return
         }
+
+        for lg in [a, b] {
+            let (st, cont) = AsyncStream<AnalyzerInput>.makeStream()
+            conts[lg.id] = cont
+            do { try await analyzers[lg.id]!.start(inputSequence: st) }
+            catch { stato = "avvio fallito (\(lg.id)): \(error)"; svuotaTutto(); return }
+        }
+
+        // Prova senza parlare: `DV_PROVA=/percorso/frase.wav` da' in pasto un
+        // file invece del microfono, alla velocita' con cui sarebbe stato
+        // pronunciato. Serve a vedere se l'app funziona prima di sedersi a
+        // tavola con qualcuno, e a fotografare la striscia in diretta senza
+        // far uscire un suono dagli altoparlanti. Il microfono qui non si
+        // accende affatto: accenderlo per spegnerlo subito era il modo di
+        // pagare un deadlock per un'apparecchiatura che non serve.
+        if let prova = ProcessInfo.processInfo.environment["DV_PROVA"] {
+            inAscolto = true
+            stato = "prova da file — nessun microfono"
+            Task { [weak self] in await self?.daFile(prova.split(separator: ":").map(String.init),
+                                                     formato: fmtASR) }
+            return
+        }
+
+        if let guasto = await accendiMicrofono(fmtASR, conts) {
+            stato = guasto; svuotaTutto(); return
+        }
+        microfonoAcceso = true
+        inAscolto = true
+        stato = "in ascolto — parlate pure"
+    }
+
+    /// Accende il microfono e ci attacca la presa. Gira FUORI dal main actor:
+    /// e' l'unico punto che puo' bloccarsi, e bloccarsi sul main significa
+    /// un'app congelata invece di un errore. Torna `nil` se e' andata bene,
+    /// altrimenti il messaggio da mostrare.
+    private nonisolated func accendiMicrofono(
+        _ fmtASR: AVAudioFormat,
+        _ conti: [String: AsyncStream<AnalyzerInput>.Continuation]
+    ) async -> String? {
         let input = engine.inputNode
         let fmtMic = input.outputFormat(forBus: 0)
         guard let conv = AVAudioConverter(from: fmtMic, to: fmtASR) else {
-            stato = "conversione audio impossibile"; return
+            return "conversione audio impossibile"
         }
-
-        for (breve, _) in Self.lingue {
-            let (st, cont) = AsyncStream<AnalyzerInput>.makeStream()
-            conts[breve] = cont
-            do { try await analyzers[breve]!.start(inputSequence: st) }
-            catch { stato = "avvio fallito (\(breve)): \(error)"; return }
-        }
-
-        let conti = conts
         var contaBuffer = 0
         input.installTap(onBus: 0, bufferSize: 4096, format: fmtMic) { [weak self] buf, _ in
             let cap = AVAudioFrameCount(
@@ -173,26 +253,16 @@ final class Motore {
                 self.livello = self.livello * 0.6 + v * 0.4
             }
         }
-
-        // Prova senza parlare: `DV_PROVA=/percorso/frase.wav` da' in pasto un
-        // file invece del microfono, alla velocita' con cui sarebbe stato
-        // pronunciato. Serve a vedere se l'app funziona prima di sedersi a
-        // tavola con qualcuno, e a me e' servita per fotografare la striscia
-        // in diretta senza far uscire un suono dagli altoparlanti.
-        if let prova = ProcessInfo.processInfo.environment["DV_PROVA"] {
-            input.removeTap(onBus: 0)
-            inAscolto = true
-            stato = "prova da file — nessun microfono"
-            Task { [weak self] in await self?.daFile(prova.split(separator: ":").map(String.init),
-                                                     formato: fmtASR) }
-            return
-        }
-
         do { try engine.start() } catch {
-            stato = "microfono non disponibile: \(error.localizedDescription)"; return
+            input.removeTap(onBus: 0)
+            return "microfono non disponibile: \(error.localizedDescription)"
         }
-        inAscolto = true
-        stato = "in ascolto — parlate pure"
+        return nil
+    }
+
+    private nonisolated func spegniMicrofono() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
     }
 
     /// Riproduce i file verso i trascrittori al ritmo del parlato. Alimentare
@@ -257,9 +327,10 @@ final class Motore {
         livello = 0
     }
 
-    func ferma() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+    /// Smonta tutto quello che `avvia` ha costruito. Serve anche a meta'
+    /// avvio: se l'avvio fallisce e i trascrittori restano appesi, il tentativo
+    /// successivo ne crea altri due e l'audio finisce a quattro.
+    private func svuotaTutto() {
         for (_, c) in conts { c.finish() }
         conts.removeAll()
         for t in tasks { t.cancel() }
@@ -267,7 +338,16 @@ final class Motore {
         analyzers.removeAll(); transcribers.removeAll()
         attesaChiusura?.cancel()
         vive.removeAll(); finali.removeAll(); capofila = nil
+        attesiInRitardo.removeAll()
         livello = 0
+    }
+
+    func ferma() async {
+        if microfonoAcceso {
+            microfonoAcceso = false
+            await Task.detached { [self] in spegniMicrofono() }.value
+        }
+        svuotaTutto()
         inAscolto = false
         stato = "fermo"
     }
@@ -277,10 +357,13 @@ final class Motore {
     /// Testo provvisorio: cresce parola per parola mentre si parla. Serve a
     /// due cose — farlo vedere, e sapere in anticipo chi dei due sta vincendo.
     private func provvisorio(lingua: String, testo: String) {
+        // un parziale nuovo vuol dire una frase nuova: quello che deve ancora
+        // arrivare da qui in poi non e' piu' il residuo di quella pubblicata
+        attesiInRitardo.remove(lingua)
         vive[lingua] = testo
-        let it = vive["it"] ?? "", pt = vive["pt"] ?? ""
-        if !it.isEmpty || !pt.isEmpty {
-            capofila = Router.decidi(it: it, pt: pt).lingua
+        let tA = vive[a.id] ?? "", tB = vive[b.id] ?? ""
+        if !tA.isEmpty || !tB.isEmpty {
+            capofila = Router.decidi(a, tA, b, tB).lingua.id
         }
     }
 
@@ -290,10 +373,11 @@ final class Motore {
     /// Se a chiudere e' il trascrittore che gia' guidava sui provvisori, la
     /// prova c'e' gia' e si pubblica subito.
     private func definitivo(lingua: String, testo: String) {
+        if attesiInRitardo.remove(lingua) != nil { return }
         finali[lingua] = testo
         attesaChiusura?.cancel()
 
-        if finali.count == Self.lingue.count || lingua == capofila {
+        if finali.count == 2 || lingua == capofila {
             chiudi(); return
         }
         attesaChiusura = Task { [weak self] in
@@ -307,16 +391,17 @@ final class Motore {
         attesaChiusura?.cancel()
         // per chi non ha ancora chiuso vale l'ultimo provvisorio: e' quello
         // che ha capito, anche se non l'ha ancora dichiarato definitivo
-        let it = finali["it"] ?? vive["it"] ?? ""
-        let pt = finali["pt"] ?? vive["pt"] ?? ""
+        let tA = finali[a.id] ?? vive[a.id] ?? ""
+        let tB = finali[b.id] ?? vive[b.id] ?? ""
+        attesiInRitardo = Set([a.id, b.id]).subtracting(finali.keys)
         finali.removeAll(); vive.removeAll(); capofila = nil
-        guard !(it.isEmpty && pt.isEmpty) else { return }
+        guard !(tA.isEmpty && tB.isEmpty) else { return }
 
-        let v = Router.decidi(it: it, pt: pt)
+        let v = Router.decidi(a, tA, b, tB)
         guard !v.testo.isEmpty else { return }
-        let b = Battuta(lingua: v.lingua, originale: v.testo, margine: v.margine)
-        battute.append(b)
-        daTradurre.append(b)
+        let btt = Battuta(lingua: v.lingua, originale: v.testo, margine: v.margine)
+        battute.append(btt)
+        daTradurre.append(btt)
         if battute.count > 200 { battute.removeFirst(battute.count - 200) }
     }
 
@@ -330,14 +415,16 @@ final class Motore {
 // -------------------------------------------------------------------- la vista
 
 struct Targhetta: View {
-    let lingua: String
+    let sigla: String
+    /// la prima lingua e' blu, la seconda verde: due voci, due colori
+    let prima: Bool
     var acceso = true
+    var scala: CGFloat = 1
     var body: some View {
-        Text(lingua == "it" ? "IT" : "PT")
-            .font(.system(size: 10, weight: .bold, design: .rounded))
+        Text(sigla)
+            .font(.system(size: 10 * min(scala, 1.4), weight: .bold, design: .rounded))
             .padding(.horizontal, 6).padding(.vertical, 2)
-            .background((lingua == "it" ? Color.blue : Color.green)
-                .opacity(acceso ? 0.85 : 0.25))
+            .background((prima ? Color.blue : Color.green).opacity(acceso ? 0.85 : 0.25))
             .foregroundStyle(acceso ? .white : .secondary)
             .clipShape(Capsule())
     }
@@ -345,27 +432,32 @@ struct Targhetta: View {
 
 struct Riga: View {
     let b: Battuta
+    let sigla: String
+    let prima: Bool
+    let scala: CGFloat
+
     var body: some View {
-        let daIt = b.lingua == "it"
-        VStack(alignment: daIt ? .leading : .trailing, spacing: 3) {
+        VStack(alignment: prima ? .leading : .trailing, spacing: 3 * scala) {
             HStack(spacing: 6) {
-                Targhetta(lingua: b.lingua)
+                Targhetta(sigla: sigla, prima: prima, scala: scala)
                 if b.margine == 0 {
                     // onesta' a schermo: qui la decisione e' stata in bilico
                     Image(systemName: "questionmark.circle")
-                        .font(.system(size: 10)).foregroundStyle(.orange)
+                        .font(.system(size: 10 * scala)).foregroundStyle(.orange)
                         .help("lingua decisa per un soffio")
                 }
             }
             Text(b.tradotta.isEmpty ? "…" : b.tradotta)
-                .font(.system(size: 21, weight: .medium))
+                .font(.system(size: 21 * scala, weight: .medium))
                 .foregroundStyle(.primary)
+                .multilineTextAlignment(prima ? .leading : .trailing)
             Text(b.originale)
-                .font(.system(size: 13))
+                .font(.system(size: 13 * scala))
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(prima ? .leading : .trailing)
         }
-        .frame(maxWidth: .infinity, alignment: daIt ? .leading : .trailing)
-        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: prima ? .leading : .trailing)
+        .padding(.vertical, 5 * scala)
     }
 }
 
@@ -392,19 +484,22 @@ struct Vu: View {
 /// questo momento, uno sopra l'altro. Chi guida e' acceso, l'altro spento.
 /// Si vede chi sta parlando mentre parla, senza aspettare la frase finita.
 struct InDiretta: View {
+    let lingue: [Lingua]
+    let sigle: [String]
     let vive: [String: String]
     let capofila: String?
     let livello: Float
+    let scala: CGFloat
 
     var body: some View {
         VStack(spacing: 4) {
-            ForEach(["it", "pt"], id: \.self) { lg in
-                let testo = vive[lg] ?? ""
-                let guida = capofila == lg && !testo.isEmpty
+            ForEach(Array(lingue.enumerated()), id: \.element.id) { i, lg in
+                let testo = vive[lg.id] ?? ""
+                let guida = capofila == lg.id && !testo.isEmpty
                 HStack(alignment: .top, spacing: 7) {
-                    Targhetta(lingua: lg, acceso: guida)
+                    Targhetta(sigla: sigle[i], prima: i == 0, acceso: guida, scala: scala)
                     Text(testo.isEmpty ? "…" : testo)
-                        .font(.system(size: guida ? 14 : 12,
+                        .font(.system(size: (guida ? 14 : 12) * scala,
                                       weight: guida ? .medium : .regular))
                         .foregroundStyle(guida ? .primary : .tertiary)
                         .lineLimit(2)
@@ -419,30 +514,73 @@ struct InDiretta: View {
     }
 }
 
-struct ContentView: View {
-    @State private var motore = Motore()
-    @State private var cfgItPt: TranslationSession.Configuration?
-    @State private var cfgPtIt: TranslationSession.Configuration?
+/// Il menu di una delle due lingue. Le lingue il cui modello non e' ancora sul
+/// Mac sono marcate: sceglierle costa un download, e saperlo prima e' meglio
+/// che vedere l'app ferma su "scarico…" senza averlo chiesto.
+struct SceltaLingua: View {
+    @Binding var scelta: String
+    let catalogo: [Lingua]
+    let installate: Set<String>
+    let altra: String
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button(motore.inAscolto ? "Ferma" : "Ascolta") {
-                    Task {
-                        if motore.inAscolto { motore.ferma() } else { await motore.avvia() }
-                    }
-                }
-                .keyboardShortcut(.space, modifiers: [])
-                Text(motore.stato).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Text("IT ⇄ PT").font(.caption.bold()).foregroundStyle(.secondary)
+        Picker("", selection: $scelta) {
+            ForEach(catalogo) { lg in
+                Text(lg.nome + (installate.contains(lg.asr) ? "" : " ↓")
+                     + (lg.asr == altra ? "  •" : ""))
+                    .tag(lg.asr)
             }
-            .padding(10)
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(maxWidth: 190)
+    }
+}
+
+struct ContentView: View {
+    @State private var motore = Motore()
+    @State private var cfgAB: TranslationSession.Configuration?
+    @State private var cfgBA: TranslationSession.Configuration?
+
+    @State private var catalogo: [Lingua] = []
+    @State private var installate: Set<String> = []
+    @State private var avviso: String?
+
+    @AppStorage("linguaA") private var idA = Catalogo.predefinite.0
+    @AppStorage("linguaB") private var idB = Catalogo.predefinite.1
+    @AppStorage("dimensione") private var dimGrezza = Dimensione.medio.rawValue
+
+    private var dim: Dimensione { Dimensione(rawValue: dimGrezza) ?? .medio }
+    private var a: Lingua { risolvi(idA, difetto: Catalogo.predefinite.0) }
+    private var b: Lingua { risolvi(idB, difetto: Catalogo.predefinite.1) }
+
+    /// Prima che il catalogo sia caricato la coppia va costruita lo stesso:
+    /// il correttore risponde subito, e' l'elenco dell'ASR che e' asincrono.
+    private func risolvi(_ id: String, difetto: String) -> Lingua {
+        if let l = catalogo.first(where: { $0.id == id }) { return l }
+        let disp = Set(NSSpellChecker.shared.availableLanguages)
+        if let c = Catalogo.correttorePer(id, disponibili: disp) {
+            return Lingua(asr: id, corr: c)
+        }
+        return Lingua(asr: difetto,
+                      corr: Catalogo.correttorePer(difetto, disponibili: disp) ?? "en")
+    }
+
+    var body: some View {
+        let (sA, sB) = sigle(a, b)
+        VStack(spacing: 0) {
+            barra(sA, sB)
             Divider()
             ScrollViewReader { p in
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(motore.battute) { b in Riga(b: b).id(b.id) }
+                        ForEach(motore.battute) { btt in
+                            Riga(b: btt,
+                                 sigla: btt.lingua.id == a.id ? sA : sB,
+                                 prima: btt.lingua.id == a.id,
+                                 scala: dim.scala)
+                                .id(btt.id)
+                        }
                     }.padding(.horizontal, 14).padding(.vertical, 8)
                 }
                 .onChange(of: motore.battute.count) {
@@ -453,30 +591,129 @@ struct ContentView: View {
             }
             if motore.inAscolto {
                 Divider()
-                InDiretta(vive: motore.vive, capofila: motore.capofila,
-                          livello: motore.livello)
+                InDiretta(lingue: [motore.a, motore.b], sigle: [sA, sB],
+                          vive: motore.vive, capofila: motore.capofila,
+                          livello: motore.livello, scala: dim.scala)
             }
         }
-        .frame(minWidth: 520, minHeight: 380)
-        // le due sessioni si aprono all'avvio dell'app, non al primo "Ascolta":
-        // la prima traduzione paga il caricamento del modello, e pagarlo
-        // mentre nessuno ha ancora parlato non costa niente a nessuno
-        .task {
-            // in prova da file si parte da soli: non c'e' nessuno da aspettare
-            if ProcessInfo.processInfo.environment["DV_PROVA"] != nil { await motore.avvia() }
-            cfgItPt = .init(source: .init(identifier: "it"),
-                            target: .init(identifier: "pt-BR"))
-            cfgPtIt = .init(source: .init(identifier: "pt-BR"),
-                            target: .init(identifier: "it"))
-        }
-        .translationTask(cfgItPt) { s in await svuota(s, da: "it") }
-        .translationTask(cfgPtIt) { s in await svuota(s, da: "pt") }
+        .frame(minWidth: 620, minHeight: 380)
+        .task { await preparaLingue() }
+        // cambiare lingua vuol dire rifare i trascrittori: nascono con la loro
+        .onChange(of: idA) { Task { await cambiaCoppia() } }
+        .onChange(of: idB) { Task { await cambiaCoppia() } }
+        .translationTask(cfgAB) { s in await svuota(s, da: a.id) }
+        .translationTask(cfgBA) { s in await svuota(s, da: b.id) }
     }
+
+    @ViewBuilder
+    private func barra(_ sA: String, _ sB: String) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button(motore.inAscolto ? "Ferma" : "Ascolta") {
+                    Task {
+                        if motore.inAscolto { await motore.ferma() }
+                        else { await motore.avvia(a, b) }
+                    }
+                }
+                .keyboardShortcut(.space, modifiers: [])
+
+                Text(motore.stato).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 8)
+
+                SceltaLingua(scelta: $idA, catalogo: catalogo,
+                             installate: installate, altra: idB)
+                Button {
+                    let x = idA; idA = idB; idB = x
+                } label: { Image(systemName: "arrow.left.arrow.right") }
+                    .help("scambia le due lingue")
+                SceltaLingua(scelta: $idB, catalogo: catalogo,
+                             installate: installate, altra: idA)
+
+                Menu {
+                    Picker("Dimensione", selection: $dimGrezza) {
+                        ForEach(Dimensione.allCases) { d in
+                            Text(d.nome).tag(d.rawValue)
+                        }
+                    }.pickerStyle(.inline)
+                } label: {
+                    Image(systemName: "textformat.size")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("dimensione del testo (⌘+ / ⌘−)")
+            }
+            .padding(.horizontal, 10).padding(.vertical, 8)
+
+            if let avviso {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(avviso).font(.caption)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.bottom, 7)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ le lingue
+
+    private func preparaLingue() async {
+        let supportate = await SpeechTranscriber.supportedLocales.map { $0.identifier(.bcp47) }
+        installate = Set(await SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+        catalogo = Catalogo.costruisci(supportate)
+        // una scelta salvata che non e' piu' valida (o che non lo e' mai stata)
+        // torna alla coppia di partenza invece di far giudicare il router da un
+        // dizionario che non esiste
+        if !catalogo.contains(where: { $0.id == idA }) { idA = Catalogo.predefinite.0 }
+        if !catalogo.contains(where: { $0.id == idB }) { idB = Catalogo.predefinite.1 }
+        await cambiaCoppia(riavvia: false)
+        // in prova da file si parte da soli: non c'e' nessuno da aspettare
+        if ProcessInfo.processInfo.environment["DV_PROVA"] != nil {
+            await motore.avvia(a, b)
+        }
+    }
+
+    /// Rifa' le due sessioni di traduzione e, se il motore era acceso, i
+    /// trascrittori. Le sessioni si aprono qui e non al primo "Ascolta": la
+    /// prima traduzione paga il caricamento del modello, e pagarlo mentre
+    /// nessuno ha ancora parlato non costa niente a nessuno.
+    private func cambiaCoppia(riavvia: Bool = true) async {
+        avviso = await diagnosi()
+        cfgAB = .init(source: .init(identifier: a.asr), target: .init(identifier: b.asr))
+        cfgBA = .init(source: .init(identifier: b.asr), target: .init(identifier: a.asr))
+        if riavvia && motore.inAscolto {
+            await motore.ferma()
+            await motore.avvia(a, b)
+        }
+    }
+
+    /// Le due cose che possono rendere inutile una coppia, dette prima invece
+    /// che scoperte a tavola.
+    private func diagnosi() async -> String? {
+        if a.id == b.id {
+            return "le due lingue sono la stessa: scegline un'altra da un lato."
+        }
+        if a.corr == b.corr {
+            // pt-BR contro pt-PT: il correttore ha un dizionario solo, quindi
+            // i due testi valgono sempre uguale e il router non decide piu'
+            return "\(a.nome) e \(b.nome) condividono il dizionario del correttore: il router non puo' distinguerle."
+        }
+        let st = await LanguageAvailability().status(
+            from: .init(identifier: a.asr), to: .init(identifier: b.asr))
+        if case .unsupported = st {
+            return "macOS non traduce \(a.nome) → \(b.nome): resta la trascrizione, senza traduzione."
+        }
+        return nil
+    }
+
+    // --------------------------------------------------------- la traduzione
 
     private func svuota(_ s: TranslationSession, da lingua: String) async {
         try? await s.prepareTranslation()
         while !Task.isCancelled {
-            let quelli = motore.daTradurre.filter { $0.lingua == lingua }
+            let quelli = motore.daTradurre.filter { $0.lingua.id == lingua }
             if quelli.isEmpty {
                 try? await Task.sleep(for: .milliseconds(120)); continue
             }
@@ -492,8 +729,20 @@ struct ContentView: View {
 
 @main
 struct DueVociApp: App {
+    @AppStorage("dimensione") private var dimGrezza = Dimensione.medio.rawValue
+
     var body: some Scene {
         WindowGroup("Due Voci") { ContentView() }
-            .defaultSize(width: 620, height: 460)
+            .defaultSize(width: 720, height: 480)
+            .commands {
+                CommandGroup(after: .toolbar) {
+                    Button("Testo più grande") {
+                        dimGrezza = min(dimGrezza + 1, Dimensione.enorme.rawValue)
+                    }.keyboardShortcut("+", modifiers: .command)
+                    Button("Testo più piccolo") {
+                        dimGrezza = max(dimGrezza - 1, Dimensione.piccolo.rawValue)
+                    }.keyboardShortcut("-", modifiers: .command)
+                }
+            }
     }
 }
